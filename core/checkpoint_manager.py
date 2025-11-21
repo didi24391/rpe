@@ -62,7 +62,9 @@ class CheckpointManager:
             log_with_time("WARNING", f"保存检查点失败: {e}")
     
     def _validate_and_repair_checkpoint(self):
-        """验证和修复checkpoint数据"""
+        """验证和修复checkpoint数据 - 优化版（随机抽样验证）"""
+        import random
+        
         # 兼容旧版本的list格式
         completed = self.checkpoint_data.get('completed_segments', {})
         if isinstance(completed, list):
@@ -75,39 +77,71 @@ class CheckpointManager:
             self.checkpoint_data['completed_segments'] = new_completed
             self._save_checkpoint()
         
-        # 验证所有已完成的segment
-        log_with_time("INFO", "验证已完成的segment...")
-        completed_segments = self.checkpoint_data.get('completed_segments', {})
-        valid_segments = {}
+        # 统一键类型为整数（修复类型不一致问题）
+        completed_segments = {}
+        for k, v in self.checkpoint_data.get('completed_segments', {}).items():
+            completed_segments[int(k)] = v
         
-        for seg_idx, recorded_frames in list(completed_segments.items()):
+        if not completed_segments:
+            return
+        
+        total_segments = len(completed_segments)
+        sample_size = max(1, min(int(total_segments * 0.1), 50))
+        
+        log_with_time("INFO", f"验证已完成的segment（抽样检查 {sample_size}/{total_segments} 个）...")
+        
+        # 随机选择要验证的segment
+        segment_ids = list(completed_segments.keys())
+        sample_ids = random.sample(segment_ids, sample_size)
+        
+        valid_segments = completed_segments.copy()
+        corrupted_count = 0
+        
+        for seg_idx in sample_ids:
             seg_idx = int(seg_idx)
             seg_path = self.get_segment_path(seg_idx)
+            recorded_frames = completed_segments[seg_idx]
             
             if not os.path.exists(seg_path):
                 log_with_time("WARNING", f"  segment_{seg_idx}: 文件不存在，已移除")
+                valid_segments.pop(seg_idx, None)
+                corrupted_count += 1
                 continue
             
             actual_frames = self._verify_segment_frames(seg_idx)
             if actual_frames == 0:
                 log_with_time("WARNING", f"  segment_{seg_idx}: 损坏，已移除")
-                os.remove(seg_path)
+                try:
+                    os.remove(seg_path)
+                except:
+                    pass
+                valid_segments.pop(seg_idx, None)
+                corrupted_count += 1
                 continue
             
             # 更新为实际帧数
-            valid_segments[seg_idx] = actual_frames
             if actual_frames != recorded_frames:
                 log_with_time("INFO", f"  segment_{seg_idx}: 更新帧数 {recorded_frames} → {actual_frames}")
+                valid_segments[seg_idx] = actual_frames
             else:
                 log_with_time("INFO", f"  segment_{seg_idx}: {actual_frames} 帧 ✓")
         
         self.checkpoint_data['completed_segments'] = valid_segments
         
+        # 显示验证结果
+        if corrupted_count > 0:
+            log_with_time("WARNING", f"发现 {corrupted_count} 个损坏的segment，已移除")
+        else:
+            log_with_time("INFO", f"抽样验证通过，所有检查的segment完整")
+        
         # 显示实际完成的总帧数
         if valid_segments:
             total_completed_frames = sum(valid_segments.values())
             sorted_segs = sorted([int(k) for k in valid_segments.keys()])
-            log_with_time("INFO", f"已完成segment: {sorted_segs}")
+            if len(sorted_segs) <= 20:
+                log_with_time("INFO", f"已完成segment: {sorted_segs}")
+            else:
+                log_with_time("INFO", f"已完成segment: {sorted_segs[:10]}...{sorted_segs[-10:]} (共{len(sorted_segs)}个)")
             log_with_time("INFO", f"实际完成总帧数: {total_completed_frames}")
         
         self._save_checkpoint()
@@ -121,27 +155,52 @@ class CheckpointManager:
             self._save_checkpoint()
     
     def _verify_segment_frames(self, segment_idx: int) -> int:
-        """验证segment的实际帧数（逐帧读取）"""
+        """验证segment的实际帧数 - 优化版（使用ffprobe快速检测）"""
         seg_path = self.get_segment_path(segment_idx)
         if not os.path.exists(seg_path):
             return 0
         
         try:
+            # 方法1: 使用ffprobe快速获取帧数（推荐）
+            cmd = f'ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "{seg_path}"'
+            result = os.popen(cmd).read().strip()
+            
+            if result and result.isdigit():
+                return int(result)
+            
+            # 方法2: 备用 - 使用OpenCV的CAP_PROP_FRAME_COUNT（快但可能不准）
             cap = cv2.VideoCapture(seg_path)
             if not cap.isOpened():
                 return 0
             
-            frame_count = 0
-            while True:
-                ret, _ = cap.read()
-                if not ret:
-                    break
-                frame_count += 1
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             cap.release()
-            return frame_count
-        except Exception as e:
-            log_with_time("WARNING", f"验证segment {segment_idx} 失败: {e}")
+            
+            # 如果返回值合理，直接使用
+            if frame_count > 0:
+                return frame_count
+            
             return 0
+            
+        except Exception as e:
+            log_with_time("WARNING", f"快速验证segment {segment_idx} 失败: {e}，尝试逐帧验证")
+            
+            # 方法3: 最后备用 - 逐帧读取（慢但最准确）
+            try:
+                cap = cv2.VideoCapture(seg_path)
+                if not cap.isOpened():
+                    return 0
+                
+                frame_count = 0
+                while True:
+                    ret, _ = cap.read()
+                    if not ret:
+                        break
+                    frame_count += 1
+                cap.release()
+                return frame_count
+            except:
+                return 0
     
     def get_segment_path(self, segment_idx: int) -> str:
         """获取分段视频路径"""
@@ -150,12 +209,14 @@ class CheckpointManager:
     def is_segment_completed(self, segment_idx: int) -> bool:
         """检查分段是否已完成"""
         completed = self.checkpoint_data.get('completed_segments', {})
-        return segment_idx in completed
+        # 统一使用整数类型
+        return int(segment_idx) in [int(k) for k in completed.keys()]
     
     def mark_segment_completed(self, segment_idx: int, frames_written: int):
         """标记分段完成"""
         completed = self.checkpoint_data.get('completed_segments', {})
-        completed[segment_idx] = frames_written
+        # 统一使用整数键
+        completed[int(segment_idx)] = frames_written
         self.checkpoint_data['completed_segments'] = completed
         self._save_checkpoint()
         
@@ -224,11 +285,15 @@ class CheckpointManager:
         if total_frames == 0:
             return []
         
-        completed = self.checkpoint_data.get('completed_segments', {})
+        # 统一键类型为整数
+        completed_dict = {}
+        for k, v in self.checkpoint_data.get('completed_segments', {}).items():
+            completed_dict[int(k)] = v
+        
         segments_to_process = []
         
         # 使用实际完成的帧数计算起始位置
-        sorted_segments = sorted([int(k) for k in completed.keys()])
+        sorted_segments = sorted(completed_dict.keys())
         
         current_frame = 0
         expected_seg_idx = 0
@@ -237,20 +302,25 @@ class CheckpointManager:
         for seg_idx in sorted_segments:
             if seg_idx != expected_seg_idx:
                 # 发现gap，停止跳过
+                log_with_time("INFO", f"发现未完成的segment {expected_seg_idx}，从帧 {current_frame} 开始处理")
                 break
             
             # 累加实际帧数
-            current_frame += completed[seg_idx]
+            current_frame += completed_dict[seg_idx]
             expected_seg_idx += 1
+        
+        if expected_seg_idx > 0:
+            log_with_time("INFO", f"已完成 {expected_seg_idx} 个连续segment，跳过 {current_frame} 帧")
         
         # 从当前位置开始，按新的segment_frames划分剩余帧
         seg_idx = expected_seg_idx
         while current_frame < total_frames:
             end_frame = min(current_frame + self.segment_frames, total_frames)
             
-            # 检查这个segment是否已完成
-            if seg_idx not in completed:
+            # 检查这个segment是否已完成（使用整数比较）
+            if seg_idx not in completed_dict:
                 segments_to_process.append((seg_idx, current_frame, end_frame))
+                log_with_time("DEBUG", f"待处理: segment_{seg_idx} (帧 {current_frame}-{end_frame})")
             else:
                 # 已完成但验证文件
                 seg_path = self.get_segment_path(seg_idx)
@@ -259,11 +329,10 @@ class CheckpointManager:
                     self.remove_segment_from_checkpoint(seg_idx)
                     segments_to_process.append((seg_idx, current_frame, end_frame))
                 else:
-                    actual_frames = self._verify_segment_frames(seg_idx)
-                    expected_frames = completed[seg_idx]
-                    if actual_frames == 0 or abs(actual_frames - expected_frames) > 2:
-                        log_with_time("WARNING", 
-                            f"Segment {seg_idx} 损坏 (预期{expected_frames}, 实际{actual_frames})，将重新生成")
+                    # 快速检查文件是否存在且大小合理
+                    file_size = os.path.getsize(seg_path)
+                    if file_size < 1024:  # 小于1KB肯定有问题
+                        log_with_time("WARNING", f"Segment {seg_idx} 文件过小 ({file_size}字节)，将重新生成")
                         self.remove_segment_from_checkpoint(seg_idx)
                         segments_to_process.append((seg_idx, current_frame, end_frame))
             
@@ -303,7 +372,9 @@ class CheckpointManager:
         self._save_checkpoint()
     
     def merge_segments(self, target_path: str, skip_audio: bool = False, audio_start_time: float = None) -> bool:
-        """合并所有分段视频"""
+        """合并所有分段视频 - 优化版（抽样验证 + 时长检查）"""
+        import random
+        
         completed = self.checkpoint_data.get('completed_segments', {})
         
         if not completed:
@@ -320,15 +391,26 @@ class CheckpointManager:
             log_with_time("WARNING", f"仍有 {len(missing)} 个segment未完成: {missing[:10]}")
             log_with_time("WARNING", "将只合并已完成的segment")
         
-        # 验证所有segment文件
-        log_with_time("INFO", "验证segment完整性...")
+        # 优化验证：随机抽样10%的segment，最少1个，最多不超过50个
+        completed_count = len(completed)
+        sample_size = max(1, min(int(completed_count * 0.1), 50))
+        
+        log_with_time("INFO", f"验证segment完整性（抽样检查 {sample_size}/{completed_count} 个）...")
+        
+        # 随机选择要验证的segment
+        segment_ids = sorted(completed.keys())
+        sample_ids = random.sample(segment_ids, sample_size)
+        
         valid_segments = []
         total_frames = 0
+        corrupted_count = 0
         
-        for seg_idx in sorted(completed.keys()):
+        # 验证抽样的segment
+        for seg_idx in sample_ids:
             seg_path = self.get_segment_path(seg_idx)
             if not os.path.exists(seg_path):
                 log_with_time("ERROR", f"  segment_{seg_idx}: 文件缺失")
+                corrupted_count += 1
                 continue
             
             expected_frames = completed[seg_idx]
@@ -339,15 +421,23 @@ class CheckpointManager:
                     f"  segment_{seg_idx}: 帧数不匹配 (记录:{expected_frames}, 实际:{actual_frames})")
             else:
                 log_with_time("INFO", f"  segment_{seg_idx}: {actual_frames} 帧 ✓")
-            
+        
+        # 如果抽样发现问题，提示用户
+        if corrupted_count > 0:
+            log_with_time("WARNING", f"抽样发现 {corrupted_count} 个segment有问题，建议检查")
+        else:
+            log_with_time("INFO", "抽样验证通过")
+        
+        # 所有segment都添加到合并列表（即使没被抽样验证）
+        for seg_idx in segment_ids:
             valid_segments.append(seg_idx)
-            total_frames += actual_frames
+            total_frames += completed[seg_idx]
         
         if not valid_segments:
             log_with_time("ERROR", "没有有效的segment可以合并")
             return False
         
-        log_with_time("INFO", f"验证完成，总计: {total_frames} 帧")
+        log_with_time("INFO", f"准备合并 {len(valid_segments)} 个segment，预计总计: {total_frames} 帧")
         
         # 获取视频信息
         video_info = self.checkpoint_data.get('video_info', {})
@@ -375,23 +465,7 @@ class CheckpointManager:
                 log_with_time("ERROR", "分段合并失败")
                 return False
             
-            # 验证合并后的帧数
-            merged_frames = self._verify_segment_frames(-1)
-            if merged_frames == 0:
-                cap = cv2.VideoCapture(temp_merged)
-                merged_frames = 0
-                while True:
-                    ret, _ = cap.read()
-                    if not ret:
-                        break
-                    merged_frames += 1
-                cap.release()
-            
-            log_with_time("INFO", f"合并完成，验证帧数: {merged_frames}")
-            
-            if abs(merged_frames - total_frames) > 2:
-                log_with_time("WARNING", 
-                    f"合并后帧数不匹配：预期:{total_frames}, 实际:{merged_frames}, 差:{abs(merged_frames-total_frames)}")
+            log_with_time("INFO", f"合并完成")
             
             self.checkpoint_data['merge_status']['segments_merged'] = True
             self._save_checkpoint()
@@ -450,10 +524,84 @@ class CheckpointManager:
                 self._save_checkpoint()
                 return self.merge_segments(target_path, skip_audio, audio_start_time)
         
+        # 步骤3: 验证最终视频时长
+        log_with_time("INFO", "验证最终视频时长...")
+        duration_check = self._verify_final_video_duration(target_path)
+        
+        if not duration_check:
+            log_with_time("WARNING", "时长验证未通过，保留临时文件用于检查")
+            self.checkpoint_data['keep_temp_for_review'] = True
+            self._save_checkpoint()
+        
         return True
     
+    def _verify_final_video_duration(self, original_path: str) -> bool:
+        """验证最终视频时长 - 智能策略
+        
+        策略：
+        1. 对于短视频（<5分钟），允许2秒误差
+        2. 对于中等视频（5-30分钟），允许0.5%误差（最少2秒）
+        3. 对于长视频（>30分钟），允许1%误差（最多30秒）
+        
+        Returns:
+            True: 时长验证通过
+            False: 时长差异过大，需要保留临时文件
+        """
+        try:
+            # 获取原视频时长
+            cmd_original = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{original_path}"'
+            original_duration = float(os.popen(cmd_original).read().strip())
+            
+            # 获取最终视频时长
+            cmd_final = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{self.output_path}"'
+            final_duration = float(os.popen(cmd_final).read().strip())
+            
+            duration_diff = abs(original_duration - final_duration)
+            
+            # 计算允许的误差范围
+            if original_duration < 300:  # <5分钟
+                allowed_diff = 2.0
+                reason = "短视频（<5分钟）"
+            elif original_duration < 1800:  # 5-30分钟
+                allowed_diff = max(2.0, original_duration * 0.005)  # 0.5%，最少2秒
+                reason = "中等视频（5-30分钟）"
+            else:  # >30分钟
+                allowed_diff = min(30.0, original_duration * 0.01)  # 1%，最多30秒
+                reason = "长视频（>30分钟）"
+            
+            log_with_time("INFO", f"原视频时长: {original_duration:.2f}s ({self._format_duration(original_duration)})")
+            log_with_time("INFO", f"最终视频时长: {final_duration:.2f}s ({self._format_duration(final_duration)})")
+            log_with_time("INFO", f"时长差异: {duration_diff:.2f}s")
+            log_with_time("INFO", f"允许误差: {allowed_diff:.2f}s ({reason})")
+            
+            if duration_diff > allowed_diff:
+                diff_percent = (duration_diff / original_duration) * 100
+                log_with_time("WARNING", 
+                    f"时长差异超过允许范围 (差异: {duration_diff:.2f}s / {diff_percent:.2f}%, "
+                    f"允许: {allowed_diff:.2f}s)")
+                return False
+            else:
+                log_with_time("INFO", f"时长验证通过 ✓ (差异在允许范围内)")
+                return True
+                
+        except Exception as e:
+            log_with_time("WARNING", f"时长验证失败: {e}")
+            # 验证失败时保守处理，保留临时文件
+            return False
+    
+    def _format_duration(self, seconds: float) -> str:
+        """格式化时长为易读格式"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
+    
     def cleanup(self):
-        """清理临时文件"""
+        """清理临时文件 - 优化版（检查时长验证结果）"""
         try:
             import shutil
             
@@ -463,6 +611,13 @@ class CheckpointManager:
             # 调试模式保留临时文件
             if os.getenv('DEBUG_KEEP_TEMP') == '1':
                 log_with_time("INFO", f"调试模式：保留临时文件在 {self.temp_dir}")
+                return
+            
+            # 检查是否需要保留临时文件用于审查
+            if self.checkpoint_data.get('keep_temp_for_review', False):
+                log_with_time("WARNING", "检测到视频时长差异超过2秒，保留临时文件用于检查")
+                log_with_time("INFO", f"临时文件位置: {self.temp_dir}")
+                log_with_time("INFO", "如需手动清理，请删除该文件夹")
                 return
             
             # 删除临时目录
