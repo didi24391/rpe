@@ -539,9 +539,9 @@ class CheckpointManager:
         """验证最终视频时长 - 智能策略
         
         策略：
-        1. 对于短视频（<5分钟），允许2秒误差
-        2. 对于中等视频（5-30分钟），允许0.5%误差（最少2秒）
-        3. 对于长视频（>30分钟），允许1%误差（最多30秒）
+        1. 对于短视频（<5分钟），允许1秒误差
+        2. 对于中等视频（5-30分钟），允许0.1%误差（最少1秒）
+        3. 对于长视频（>30分钟），允许0.1%误差（最多2秒）
         
         Returns:
             True: 时长验证通过
@@ -560,13 +560,13 @@ class CheckpointManager:
             
             # 计算允许的误差范围
             if original_duration < 300:  # <5分钟
-                allowed_diff = 2.0
+                allowed_diff = 1.0
                 reason = "短视频（<5分钟）"
             elif original_duration < 1800:  # 5-30分钟
-                allowed_diff = max(2.0, original_duration * 0.005)  # 0.5%，最少2秒
+                allowed_diff = max(1.0, original_duration * 0.001)  # 0.1%，最少1秒
                 reason = "中等视频（5-30分钟）"
             else:  # >30分钟
-                allowed_diff = min(30.0, original_duration * 0.01)  # 1%，最多30秒
+                allowed_diff = min(2.0, original_duration * 0.001)  # 0.1%，最多2秒
                 reason = "长视频（>30分钟）"
             
             log_with_time("INFO", f"原视频时长: {original_duration:.2f}s ({self._format_duration(original_duration)})")
