@@ -1779,26 +1779,36 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
     checkpoint.set_encoder_config(encoder=encoder, crf=crf, preset=preset)
     log_with_time("INFO", f"编码器配置: {encoder}, CRF={crf}, Preset={preset}")
     
-    # 获取需要处理的segment列表
-    segments_to_process = []
-    current_frame = processing_range.start_frame
-    seg_idx = 0
-    
-    # 跳过processing_range之前的部分
-    while current_frame < processing_range.start_frame:
-        current_frame += segment_frames
-        seg_idx += 1
-    
-    # 生成processing_range内的segment列表
-    while current_frame < processing_range.end_frame:
-        seg_start = current_frame
-        seg_end = min(current_frame + segment_frames, processing_range.end_frame)
-        
-        if not checkpoint.is_segment_completed(seg_idx):
-            segments_to_process.append((seg_idx, seg_start, seg_end))
-        
-        current_frame = seg_end
-        seg_idx += 1
+    # 获取需要处理的segment列表（使用 CheckpointManager 的实际完成帧数逻辑，避免使用 seg_idx * segment_frames 的简单乘法）
+    # 说明：CheckpointManager.get_segments_to_process() 已经会使用已完成segment的实际帧数累加来计算起始帧。
+    segments_to_process = checkpoint.get_segments_to_process()
+
+    # get_segments_to_process() 返回基于 checkpoint.checkpoint_data['total_frames'] 的完整剩余分段。
+    # 但我们需要限定到 processing_range 的（start_frame, end_frame）区间——所以做一次过滤并且修正 seg_start/seg_end 到 processing_range 范围内。
+    filtered_segments = []
+    for seg_idx, seg_start, seg_end in segments_to_process:
+        # 如果段与处理范围有重合才保留，并裁剪到处理范围
+        if seg_end <= processing_range.start_frame or seg_start >= processing_range.end_frame:
+            continue
+        seg_start = max(seg_start, processing_range.start_frame)
+        seg_end = min(seg_end, processing_range.end_frame)
+        filtered_segments.append((seg_idx, seg_start, seg_end))
+
+    # 如果没有找到（可能是processing_range在中间某处，或全部已完成），需要按旧逻辑决定（保持向后兼容）
+    if not filtered_segments:
+        # 退回到基于 seg_idx 的生成方式（仅作为回退），但这段不会优先被使用
+        current_frame = processing_range.start_frame
+        seg_idx = 0
+        while current_frame < processing_range.end_frame:
+            seg_start = current_frame
+            seg_end = min(current_frame + segment_frames, processing_range.end_frame)
+            if not checkpoint.is_segment_completed(seg_idx):
+                filtered_segments.append((seg_idx, seg_start, seg_end))
+            current_frame = seg_end
+            seg_idx += 1
+
+    segments_to_process = filtered_segments
+
     
     if not segments_to_process:
         log_with_time("INFO", "处理范围内的所有segment已完成，开始合并...")
