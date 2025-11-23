@@ -44,10 +44,10 @@ class GPUMemoryBalancer:
         self.debug = debug
         
         # 预估参数(可根据实际模型调整)
-        self.MODEL_BASE_MEMORY = 1.5     # 模型基础显存(GB)
-        self.WORKER_MEMORY = 1.7         # 每个worker额外显存(GB)
+        self.MODEL_BASE_MEMORY = 0.7     # 模型基础显存(GB)
+        self.WORKER_MEMORY = 1.6         # 每个worker额外显存(GB)
         self.GPU0_OVERHEAD = 1.9         # GPU0额外开销(GB)
-        self.SAFETY_MARGIN = 0.85        # 安全系数
+        self.SAFETY_MARGIN = 0.88        # 安全系数
         
     def get_gpu_memory_info(self):
         """获取所有GPU的显存信息"""
@@ -85,7 +85,7 @@ class GPUMemoryBalancer:
                 workers_config[gpu_id] = min(2 if gpu_id == 0 else 3, self.max_workers_per_gpu)
             return workers_config
         
-        # 第一轮: 基础分配
+        # 一轮分配：GPU0扣除额外开销后，与其他GPU使用相同计算方式
         for gpu_id in self.gpu_ids:
             if gpu_id not in gpu_info:
                 workers_config[gpu_id] = 2
@@ -105,21 +105,6 @@ class GPUMemoryBalancer:
             workers = max(1, min(workers, self.max_workers_per_gpu))
             
             workers_config[gpu_id] = workers
-        
-        # 第二轮: 平衡优化 - 如果GPU0因为开销只能1个worker,但其他GPU都能2+,尝试给GPU0也分配2个
-        if 0 in workers_config and workers_config[0] == 1:
-            other_workers = [w for gid, w in workers_config.items() if gid != 0]
-            if other_workers and min(other_workers) >= 2:
-                gpu0_info = gpu_info.get(0, {})
-                if gpu0_info:
-                    required = self.MODEL_BASE_MEMORY + 2 * self.WORKER_MEMORY + self.GPU0_OVERHEAD
-                    available = gpu0_info['free'] * 0.9
-                    
-                    if available >= required:
-                        workers_config[0] = 2
-                        log_with_time("INFO", 
-                            f"GPU0优化: 虽然保守计算为1个worker,但实际可支持2个 "
-                            f"(需要{required:.1f}GB, 可用{available:.1f}GB)")
         
         return workers_config
     
