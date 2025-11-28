@@ -487,7 +487,7 @@ class GPUWorker:
     
     def __init__(self, gpu_id, source_faces, model_name='inswapper_128', max_age=70, 
                  sim_threshold=0.16, reset_interval=60, pixel_boost='128x128', 
-                 auto_pixel_boost=False, frame_resolution=None, debug=False):
+                 auto_pixel_boost=False, frame_resolution=None, debug=False, swap_all_mode=False):
         self.gpu_id = gpu_id
         self.source_faces = source_faces
         self.model_name = model_name
@@ -497,6 +497,14 @@ class GPUWorker:
         self.models = None
         self.model_manager = ModelManager()
         self.inference_pool = InferencePool()
+        
+        # Swap-All 模式配置
+        self.swap_all_mode = swap_all_mode
+        if swap_all_mode:
+            self.swap_all_source_face = source_faces['swap_face']  # 改名！
+            self.skip_positions = set(source_faces['skip_positions'])
+            if debug:
+                print(f"[DEBUG] GPU {gpu_id} 启用 Swap-All 模式，跳过位置: {self.skip_positions}")
         
         # Track管理
         self.initial_mapping_done = False
@@ -527,6 +535,7 @@ class GPUWorker:
                 print(f"[DEBUG] GPU {gpu_id} 启用自动 Pixel Boost (模型类型: {model_type})")
         else:
             self.pixel_boost_selector = None
+
 
     def get_model_options(self):
         """获取模型配置"""
@@ -596,15 +605,22 @@ class GPUWorker:
             face_swapper_session = InferenceSession(model_path, providers=providers)
             self.inference_pool.set('face_swapper', face_swapper_session)
             self.models = {"analyser": analyser}
-            
+
             # 验证source_faces
-            for i, sf in enumerate(self.source_faces):
-                if sf is None:
-                    print(f"[WARN] source_faces[{i}] is None")
-                    continue
-                emb = getattr(sf, "embedding", None)
-                model_src = getattr(sf, "source_model", getattr(sf, "detect_model", "unknown"))
-                print(f"[INFO] source_faces[{i}] loaded: source_model={model_src}, emb_norm={np.linalg.norm(np.array(emb)) if emb is not None else 'N/A'}")
+            if self.swap_all_mode:
+                # Swap-All模式：验证单个源脸
+                emb = getattr(self.swap_all_source_face, "embedding", None)  # 改名！
+                model_src = getattr(self.swap_all_source_face, "source_model", getattr(self.swap_all_source_face, "detect_model", "unknown"))
+                print(f"[INFO] Swap-All源人脸loaded: source_model={model_src}, emb_norm={np.linalg.norm(np.array(emb)) if emb is not None else 'N/A'}")
+            else:
+                # 正常模式：验证多个源脸
+                for i, sf in enumerate(self.source_faces):
+                    if sf is None:
+                        print(f"[WARN] source_faces[{i}] is None")
+                        continue
+                    emb = getattr(sf, "embedding", None)
+                    model_src = getattr(sf, "source_model", getattr(sf, "detect_model", "unknown"))
+                    print(f"[INFO] source_faces[{i}] loaded: source_model={model_src}, emb_norm={np.linalg.norm(np.array(emb)) if emb is not None else 'N/A'}")
 
             self.initialized = True
             print(f"[INFO] GPU {self.gpu_id} 准备就绪，使用模型: {self.model_name}")
@@ -788,7 +804,14 @@ class GPUWorker:
         return mask
 
     def swap_face(self, source_face, target_face, temp_vision_frame, is_skip=False):
-        """换脸主函数 - 支持pixel boost超分和skip机制"""
+        """换脸主函数 - 支持pixel boost超分和skip机制
+        
+        参数:
+            source_face: 源人脸对象（要换成的脸）
+            target_face: 目标人脸对象（视频中的脸）
+            temp_vision_frame: 当前帧图像
+            is_skip: 是否跳过换脸（已废弃，通过track_id在_safe_swap_face中处理）
+        """
         model_options = self.get_model_options()
         model_template = model_options.get('template')
         model_size = model_options.get('size')
@@ -858,29 +881,48 @@ class GPUWorker:
         # 创建遮罩
         crop_mask = self.create_simple_mask(crop_vision_frame_output)
         
-        if is_skip and self.debug:
-            print(f"[SWAP_FACE] is_skip=True，将使用透明mask")
-        
-        # 贴回原图（skip人脸使用透明化）
+        # 贴回原图（is_skip参数已废弃）
         paste_vision_frame = self.paste_back(temp_vision_frame, crop_vision_frame_output, 
                                             crop_mask, affine_matrix, 
-                                            use_transparent_mask=is_skip)
+                                            use_transparent_mask=False)
         
         return paste_vision_frame
     
     def _safe_swap_face(self, frame, target_face, source_face, debug_info="", track_id=None):
-        """安全的换脸调用"""
+        """安全的换脸调用
+        
+        参数:
+            frame: 当前帧图像
+            target_face: 目标人脸对象（视频中的脸）
+            source_face: 源人脸对象（要换成的脸）
+            debug_info: 调试信息
+            track_id: track ID
+        """
         try:
-            is_skip = track_id is not None and track_id in self.skip_face_self_faces
+            # 检查是否是SKIP track
+            is_skip = False
+            if track_id is not None:
+                if self.swap_all_mode:
+                    # Swap-All模式：检查track_source_map
+                    is_skip = self.track_source_map.get(track_id) == "SKIP"
+                else:
+                    # 正常模式：检查skip_face_self_faces
+                    is_skip = track_id in self.skip_face_self_faces
             
-            if is_skip and self.debug:
-                print(f"[DEBUG] Track {track_id} 是SKIP，执行换脸但透明化贴回")
+            if is_skip:
+                if self.debug:
+                    print(f"[DEBUG] Track {track_id} 是SKIP，跳过换脸")
+                return frame  # 直接返回原帧
             
-            return self.swap_face(source_face, target_face, frame, is_skip=is_skip)
+            # 正常换脸 - 注意参数顺序：source_face在前，target_face在后
+            return self.swap_face(source_face, target_face, frame)
         except Exception as e:
             if self.debug:
                 print(f"[DEBUG] {debug_info} 换脸失败: {e}")
+                import traceback
+                traceback.print_exc()
             return None
+        
 # ===== GPUWorker Tracking 逻辑 (续) =====
     
     def _get_embedding(self, face):
@@ -1124,8 +1166,14 @@ class GPUWorker:
                 continue            
 
             for ref_idx, ref_emb in self.initial_frame_embeddings.items():
-                if ref_idx >= len(self.source_faces):
-                    continue
+                # Swap-All模式：验证ref_idx是否在跳过位置
+                if self.swap_all_mode:
+                    # 跳过位置匹配自己，其他位置匹配源脸
+                    pass  # 继续匹配逻辑
+                else:
+                    # 正常模式：验证ref_idx范围
+                    if ref_idx >= len(self.source_faces):
+                        continue
                 
                 sim = cosine_sim(emb, ref_emb)
                 sims.append((sim, det_idx, ref_idx, emb))
@@ -1149,19 +1197,30 @@ class GPUWorker:
                 "original_emb": self.initial_frame_embeddings[ref_idx],
                 "history": []
             }
-            self.track_source_map[track_id] = ref_idx
+            
+            # Swap-All模式：根据位置决定映射类型
+            if self.swap_all_mode:
+                if ref_idx in self.skip_positions:
+                    self.track_source_map[track_id] = "SKIP"
+                    self.skip_face_self_faces[ref_idx] = faces_sorted[det_idx]
+                else:
+                    self.track_source_map[track_id] = "SWAP"
+            else:
+                # 正常模式
+                self.track_source_map[track_id] = ref_idx
+                if ref_idx in self.skip_face_self_faces:
+                    self.skip_face_self_faces[ref_idx] = faces_sorted[det_idx]
+            
             self.track_stability[track_id] = 2
-            
-            # 如果是skip track，更新自身Face对象
-            if ref_idx in self.skip_face_self_faces:
-                self.skip_face_self_faces[ref_idx] = faces_sorted[det_idx]
-            
             used_faces.add(det_idx)
             used_sources.add(ref_idx)
             reset_success = True
             
             if self.debug:
-                skip_info = " (SKIP)" if ref_idx in self.skip_face_self_faces else ""
+                if self.swap_all_mode:
+                    skip_info = " (SKIP)" if ref_idx in self.skip_positions else ""
+                else:
+                    skip_info = " (SKIP)" if ref_idx in self.skip_face_self_faces else ""
                 print(f"[DEBUG] 重置: Track {track_id} <- 源 {ref_idx} sim={sim:.3f}{skip_info}")
         
         # 保留未匹配但未过期的track
@@ -1231,7 +1290,7 @@ class GPUWorker:
         return recovered
 
     def process_frame(self, frame_path):
-        """处理单帧 - 主入口"""
+        """处理单帧 - 主入口（支持swap-all模式）"""
         if not self.models:
             return False, "模型未初始化"
 
@@ -1247,6 +1306,13 @@ class GPUWorker:
             return True, "无人脸"
 
         faces_sorted = sorted(faces, key=lambda x: x.bbox[0])
+
+        if self.swap_all_mode:
+            # Swap-All 模式处理
+            return self._process_frame_swap_all(frame, faces_sorted, frame_path)
+        else:
+            # 正常模式处理
+            return self._process_frame_normal(frame, faces_sorted, frame_path)
 
         # 第一帧初始化
         if not self.initial_mapping_done:
@@ -1415,6 +1481,361 @@ class GPUWorker:
         self.frame_idx += 1
         self._prune_tracks()
         return True, "完成"
+    def _process_frame_swap_all(self, frame, faces_sorted, frame_path):
+        """Swap-All模式的帧处理"""
+        processed_frame = frame.copy()
+        
+        # 第一帧初始化
+        if not self.initial_mapping_done:
+            if self.debug:
+                print(f"[DEBUG] GPU {self.gpu_id} Swap-All第一帧，检测到 {len(faces_sorted)} 个人脸")
+            
+            for i, face in enumerate(faces_sorted):
+                emb = self._get_embedding(face)
+                if emb is None:
+                    continue
+                
+                # 所有人脸都建立track
+                self.initial_frame_embeddings[i] = emb.copy()
+                self.track_embeddings[i] = {
+                    "emb": emb,
+                    "last_seen": self.frame_idx,
+                    "original_emb": emb.copy(),
+                    "history": []
+                }
+                self.track_stability[i] = 1
+                
+                if i in self.skip_positions:
+                    # 跳过位置：标记为SKIP，不换脸
+                    self.track_source_map[i] = "SKIP"
+                    self.skip_face_self_faces[i] = face
+                    if self.debug:
+                        print(f"[DEBUG] GPU {self.gpu_id} Track {i} 设为SKIP（位置{i}），不换脸")
+                else:
+                    # 其他位置：换成源脸
+                    self.track_source_map[i] = "SWAP"
+                    newf = self._safe_swap_face(processed_frame, face, self.swap_all_source_face,  # 改名！
+                                               f"GPU {self.gpu_id} 第一帧 Track {i}",
+                                               track_id=i)
+                    if newf is not None:
+                        processed_frame = newf
+                        if self.debug:
+                            print(f"[DEBUG] GPU {self.gpu_id} 第一帧: Track {i} 换脸成功")
+            
+            frame = processed_frame
+            self.initial_mapping_done = True
+        
+        else:
+            # 后续帧处理
+            if self._should_reset_tracking():
+                if self._reset_tracking_with_reference(faces_sorted):
+                    for tid, t in self.track_embeddings.items():
+                        src_type = self.track_source_map.get(tid)
+                        if src_type == "SKIP":
+                            continue
+                        
+                        for det_idx, face in enumerate(faces_sorted):
+                            face_emb = self._get_embedding(face)
+                            if face_emb is not None and cosine_sim(face_emb, t["emb"]) > self.sim_threshold:
+                                # 重置后换脸（非SKIP）
+                                newf = self._safe_swap_face(frame, face, self.swap_all_source_face,  # 改名！
+                                                           f"重置后 Track {tid}", track_id=tid)
+                                if newf is not None:
+                                    frame = newf
+                                    if self.debug:
+                                        print(f"[DEBUG] 重置后替换: Track {tid}")
+                                break
+                    
+                    cv2.imwrite(frame_path, frame)
+                    self.frame_idx += 1
+                    self._prune_tracks()
+                    return True, "重置完成"
+            
+            self._try_recover_lost_tracks(faces_sorted)
+            
+            # 匹配所有track
+            sims = []
+            for det_idx, face in enumerate(faces_sorted):
+                emb = self._get_embedding(face)
+                if emb is None:
+                    continue
+                
+                for tid, t in self.track_embeddings.items():
+                    avg_emb = self._get_average_embedding(tid)
+                    is_match, sim = self._adaptive_similarity_threshold(avg_emb, emb, tid)
+                    
+                    if is_match:
+                        sims.append((sim, det_idx, tid, emb))
+            
+            sims.sort(key=lambda x: x[0], reverse=True)
+            used_tracks, used_faces = set(), set()
+            new_embeddings = {}
+            
+            # 处理匹配的人脸
+            for sim, det_idx, tid, emb in sims:
+                if tid in used_tracks or det_idx in used_faces:
+                    continue
+                
+                src_type = self.track_source_map.get(tid)
+                if src_type is None:
+                    continue
+                
+                # 判断是否应该换脸（对非SKIP track）
+                should_swap = (
+                    sim > self.sim_threshold + 0.06 or
+                    sim > self.sim_threshold + 0.03 or
+                    (sim > self.sim_threshold and self._is_track_stable(tid, 1)) or
+                    (sim > self.sim_threshold - 0.03 and self._is_track_stable(tid, 2))
+                )
+                
+                if should_swap:
+                    if src_type == "SKIP":
+                        # SKIP track：不换脸，只更新缓存
+                        if det_idx < len(faces_sorted):
+                            self.skip_face_self_faces[tid] = faces_sorted[det_idx]
+                    else:
+                        # SWAP track：执行换脸
+                        newf = self._safe_swap_face(frame, faces_sorted[det_idx],
+                                                   self.swap_all_source_face, f"GPU{self.gpu_id}", track_id=tid)  # 改名！
+                        if newf is not None:
+                            frame = newf
+                            self._increment_stability(tid)
+                            if self.debug:
+                                print(f"[DEBUG] 帧{self.frame_idx} Track{tid} 替换成功 sim={sim:.3f}")
+                elif sim > self.sim_threshold - 0.03:
+                    self._increment_stability(tid)
+                    if src_type == "SKIP" and det_idx < len(faces_sorted):
+                        self.skip_face_self_faces[tid] = faces_sorted[det_idx]
+                
+                # 更新track
+                old_track = self.track_embeddings.get(tid, {})
+                new_embeddings[tid] = {
+                    "emb": emb,
+                    "last_seen": self.frame_idx,
+                    "original_emb": old_track.get("original_emb", emb),
+                    "history": old_track.get("history", [])
+                }
+                self._update_embedding_history(tid, emb)
+                
+                used_tracks.add(tid)
+                used_faces.add(det_idx)
+            
+            # 处理未匹配的新人脸（track之外出现的人脸）
+            for det_idx, face in enumerate(faces_sorted):
+                if det_idx in used_faces:
+                    continue
+                
+                emb = self._get_embedding(face)
+                if emb is None:
+                    continue
+                
+                # 创建新track，默认换成源脸
+                new_tid = max(self.track_embeddings.keys()) + 1 if self.track_embeddings else 0
+                
+                # 新人脸默认换成源脸（不在skip_positions中）
+                self.track_embeddings[new_tid] = {
+                    "emb": emb,
+                    "last_seen": self.frame_idx,
+                    "original_emb": emb.copy(),
+                    "history": []
+                }
+                self.track_source_map[new_tid] = "SWAP"
+                self.track_stability[new_tid] = 1
+                
+                # 立即换脸
+                newf = self._safe_swap_face(frame, face, self.swap_all_source_face,  # 改名！
+                                           f"GPU{self.gpu_id} 新人脸", track_id=new_tid)
+                if newf is not None:
+                    frame = newf
+                    if self.debug:
+                        print(f"[DEBUG] 帧{self.frame_idx} 新人脸 Track{new_tid} 换脸成功")
+            
+            # 保留未匹配但未过期的track
+            for tid, t in self.track_embeddings.items():
+                if tid not in new_embeddings:
+                    if self.max_age == -1 or (self.frame_idx - t["last_seen"]) <= self.max_age:
+                        new_embeddings[tid] = t
+                        if tid in self.track_stability and self.track_stability[tid] > 1:
+                            self.track_stability[tid] = max(1, self.track_stability[tid] - 1)
+            
+            self.track_embeddings = new_embeddings
+        
+        cv2.imwrite(frame_path, frame)
+        self.frame_idx += 1
+        self._prune_tracks()
+        return True, "完成"
+
+
+    def _process_frame_normal(self, frame, faces_sorted, frame_path):
+        """正常模式的帧处理（原有逻辑）"""
+        processed_frame = frame.copy()
+        
+        # 第一帧初始化
+        if not self.initial_mapping_done:
+            if self.debug:
+                print(f"[DEBUG] GPU {self.gpu_id} 处理第一帧，检测到 {len(faces_sorted)} 个人脸")
+            
+            for i, face in enumerate(faces_sorted):
+                if i >= len(self.source_faces):
+                    break
+                
+                src_face = self.source_faces[i]
+                emb = self._get_embedding(face)
+                if emb is None:
+                    continue
+
+                # 所有人脸都建立 track
+                self.initial_frame_embeddings[i] = emb.copy()
+                self.track_embeddings[i] = {
+                    "emb": emb, 
+                    "last_seen": self.frame_idx,
+                    "original_emb": emb.copy(),
+                    "history": []
+                }
+                self.track_stability[i] = 1
+                self.track_source_map[i] = i
+            
+                if src_face is None:
+                    # skip人脸：保存自身Face对象
+                    self.skip_face_self_faces[i] = face
+                    if self.debug:
+                        print(f"[DEBUG] GPU {self.gpu_id} Track {i} 设为SKIP (使用自身)")
+                else:
+                    # 正常换脸
+                    newf = self._safe_swap_face(processed_frame, face, src_face, 
+                                               f"GPU {self.gpu_id} 第一帧 Track {i}", 
+                                               track_id=i)
+                    if newf is not None:
+                        processed_frame = newf
+                        if self.debug:
+                            print(f"[DEBUG] GPU {self.gpu_id} 第一帧: Track {i} <- 源 {i} 成功")
+            
+            frame = processed_frame
+            self.initial_mapping_done = True
+
+        else:
+            # 后续帧处理
+            if self._should_reset_tracking():
+                if self._reset_tracking_with_reference(faces_sorted):
+                    # 重置后立即处理
+                    for tid, t in self.track_embeddings.items():
+                        if tid not in self.track_source_map:
+                            continue
+                        src_idx = self.track_source_map[tid]
+                        src_face = self.source_faces[src_idx]
+                        if src_face is None:
+                            continue
+                            
+                        for det_idx, face in enumerate(faces_sorted):
+                            face_emb = self._get_embedding(face)
+                            if face_emb is not None and cosine_sim(face_emb, t["emb"]) > self.sim_threshold:
+                                newf = self._safe_swap_face(frame, face, src_face, f"重置后 Track {tid}", track_id=tid)
+                                if newf is not None:
+                                    frame = newf
+                                    if self.debug:
+                                        print(f"[DEBUG] 重置后替换: Track {tid} <- 源 {src_idx}")
+                                break
+                    
+                    cv2.imwrite(frame_path, frame)
+                    self.frame_idx += 1
+                    self._prune_tracks()
+                    return True, "重置完成"
+            
+            self._try_recover_lost_tracks(faces_sorted)
+            
+            # 匹配所有track
+            sims = []
+            for det_idx, face in enumerate(faces_sorted):
+                emb = self._get_embedding(face)
+                if emb is None:
+                    continue
+                
+                for tid, t in self.track_embeddings.items():
+                    if tid not in self.track_source_map:
+                        continue
+                    
+                    avg_emb = self._get_average_embedding(tid)
+                    is_match, sim = self._adaptive_similarity_threshold(avg_emb, emb, tid)
+                    
+                    if is_match:
+                        sims.append((sim, det_idx, tid, emb))
+
+            sims.sort(key=lambda x: x[0], reverse=True)
+            used_tracks, used_faces = set(), set()
+            new_embeddings = {}
+
+            for sim, det_idx, tid, emb in sims:
+                if tid in used_tracks or det_idx in used_faces:
+                    continue
+
+                src_idx = self.track_source_map.get(tid, None)
+                if src_idx is None:
+                    continue
+                
+                # 获取源人脸（SKIP的用当前检测到的Face）
+                is_skip_track = tid in self.skip_face_self_faces
+                
+                if is_skip_track:
+                    if det_idx < len(faces_sorted):
+                        current_face = faces_sorted[det_idx]
+                        src_face = current_face
+                        self.skip_face_self_faces[tid] = current_face
+                    else:
+                        continue
+                else:
+                    src_face = self.source_faces[src_idx]
+                
+                if src_face is None:
+                    continue
+                
+                # 判断是否应该换脸
+                should_swap = (
+                    sim > self.sim_threshold + 0.06 or
+                    sim > self.sim_threshold + 0.03 or
+                    (sim > self.sim_threshold and self._is_track_stable(tid, 1)) or
+                    (sim > self.sim_threshold - 0.03 and self._is_track_stable(tid, 2))
+                )
+                
+                if should_swap:
+                    newf = self._safe_swap_face(frame, faces_sorted[det_idx], 
+                                               src_face, f"GPU{self.gpu_id}", track_id=tid)
+                    if newf is not None:
+                        frame = newf
+                        self._increment_stability(tid)
+                        if self.debug:
+                            skip_info = " (SKIP)" if is_skip_track else ""
+                            print(f"[DEBUG] 帧{self.frame_idx} Track{tid}{skip_info} 替换成功 sim={sim:.3f}")
+                elif sim > self.sim_threshold - 0.03:
+                    self._increment_stability(tid)
+                
+                # 更新track（SKIP和正常都需要）
+                old_track = self.track_embeddings.get(tid, {})
+                new_embeddings[tid] = {
+                    "emb": emb,
+                    "last_seen": self.frame_idx,
+                    "original_emb": old_track.get("original_emb", emb),
+                    "history": old_track.get("history", [])
+                }
+                self._update_embedding_history(tid, emb)
+                
+                used_tracks.add(tid)
+                used_faces.add(det_idx)
+            
+            # 保留未匹配但未过期的track
+            for tid, t in self.track_embeddings.items():
+                if tid not in new_embeddings:
+                    if self.max_age == -1 or (self.frame_idx - t["last_seen"]) <= self.max_age:
+                        new_embeddings[tid] = t
+                        if tid in self.track_stability and self.track_stability[tid] > 1:
+                            self.track_stability[tid] = max(1, self.track_stability[tid] - 1)
+            
+            self.track_embeddings = new_embeddings
+
+        cv2.imwrite(frame_path, frame)
+        self.frame_idx += 1
+        self._prune_tracks()
+        return True, "完成"
+    
 # ===== 主处理函数 =====
 
 def _process_frame_with_worker(worker, frame, faces, frame_idx, debug):
@@ -1424,43 +1845,74 @@ def _process_frame_with_worker(worker, frame, faces, frame_idx, debug):
     
     if not worker.initial_mapping_done:
         # 第一帧处理
-        for i, face in enumerate(faces_sorted):
-            if i >= len(worker.source_faces):
-                break
-            
-            src_face = worker.source_faces[i]
-            emb = worker._get_embedding(face)
-            
-            if emb is None:
-                continue
-            
-            # 所有人脸都建立track
-            worker.initial_frame_embeddings[i] = emb.copy()
-            worker.track_embeddings[i] = {
-                "emb": emb,
-                "last_seen": frame_idx,
-                "original_emb": emb.copy(),
-                "history": []
-            }
-            worker.track_stability[i] = 1
-            worker.track_source_map[i] = i
-            
-            if src_face is None:
-                # skip人脸：保存自身Face对象
-                worker.skip_face_self_faces[i] = face
-                if debug:
-                    from core.checkpoint_manager import log_with_time
-                    log_with_time("DEBUG", f"Track {i} 标记为SKIP")
-            else:
-                newf = worker._safe_swap_face(processed_frame, face, src_face, 
-                                             f"GPU{worker.gpu_id}", track_id=i)
-                if newf is not None:
-                    processed_frame = newf
+        if swap_all_mode:
+            # Swap-All模式的初始化
+            for i, face in enumerate(faces_sorted):
+                emb = worker._get_embedding(face)
+                
+                if emb is None:
+                    continue
+                
+                worker.initial_frame_embeddings[i] = emb.copy()
+                worker.track_embeddings[i] = {
+                    "emb": emb,
+                    "last_seen": track_reference_frame,
+                    "original_emb": emb.copy(),
+                    "history": []
+                }
+                worker.track_stability[i] = 1
+                
+                if i in worker.skip_positions:
+                    # 跳过位置
+                    worker.track_source_map[i] = "SKIP"
+                    worker.skip_face_self_faces[i] = face
+                    if debug:
+                        log_with_time("DEBUG", f"{thread_name} Track {i} 设为SKIP（位置{i}）")
+                else:
+                    # 换脸位置
+                    worker.track_source_map[i] = "SWAP"
+                    if debug:
+                        log_with_time("DEBUG", f"{thread_name} Track {i} 设为SWAP")
+      
+        else:
+            # 正常模式
+            for i, face in enumerate(faces_sorted):
+                if i >= len(worker.source_faces):
+                    break
+                
+                src_face = worker.source_faces[i]
+                emb = worker._get_embedding(face)
+                
+                if emb is None:
+                    continue
+                
+                # 所有人脸都建立track
+                worker.initial_frame_embeddings[i] = emb.copy()
+                worker.track_embeddings[i] = {
+                    "emb": emb,
+                    "last_seen": frame_idx,
+                    "original_emb": emb.copy(),
+                    "history": []
+                }
+                worker.track_stability[i] = 1
+                worker.track_source_map[i] = i
+                
+                if src_face is None:
+                    # skip人脸：保存自身Face对象
+                    worker.skip_face_self_faces[i] = face
+                    if debug:
+                        from core.checkpoint_manager import log_with_time
+                        log_with_time("DEBUG", f"Track {i} 标记为SKIP")
+                else:
+                    newf = worker._safe_swap_face(processed_frame, face, src_face, 
+                                                 f"GPU{worker.gpu_id}", track_id=i)
+                    if newf is not None:
+                        processed_frame = newf
         
         worker.initial_mapping_done = True
         return processed_frame
     
-    # 后续帧处理
+    # 后续帧处理（保持不变）
     if worker._should_reset_tracking():
         worker._reset_tracking_with_reference(faces)
     
@@ -1492,24 +1944,31 @@ def _process_frame_with_worker(worker, frame, faces, frame_idx, debug):
         if tid in used_tracks or det_idx in used_faces:
             continue
         
-        src_idx = worker.track_source_map.get(tid)
-        if src_idx is None:
-            continue
-        
-        # 获取源人脸（SKIP的用当前检测到的Face）
-        is_skip_track = tid in worker.skip_face_self_faces
-        
-        if is_skip_track:
-            if det_idx < len(faces_sorted):
-                current_face = faces_sorted[det_idx]
-                src_face = current_face
-                worker.skip_face_self_faces[tid] = current_face
-            else:
+        if worker.swap_all_mode:
+            # Swap-All模式
+            src_type = worker.track_source_map.get(tid)
+            if src_type is None:
                 continue
+            
+            # 不需要获取src_face，因为SKIP会在_safe_swap_face中处理
+            src_face = worker.swap_all_source_face  # 改名！对于SWAP类型使用源脸，SKIP会被跳过
         else:
-            src_face = worker.source_faces[src_idx]
+            # 正常模式
+            src_idx = worker.track_source_map.get(tid)
+            if src_idx is None:
+                continue
+            
+            # 获取源人脸（SKIP的也传入，但会在_safe_swap_face中被跳过）
+            is_skip_track = tid in worker.skip_face_self_faces
+            
+            if is_skip_track:
+                if det_idx < len(faces_sorted):
+                    worker.skip_face_self_faces[tid] = faces_sorted[det_idx]
+                src_face = worker.source_faces[src_idx]  # 实际上不会被使用
+            else:
+                src_face = worker.source_faces[src_idx]
         
-        if src_face is None:
+        if src_face is None and not (worker.swap_all_mode and worker.track_source_map.get(tid) == "SKIP"):
             continue
         
         # 判断是否应该换脸
@@ -1521,6 +1980,7 @@ def _process_frame_with_worker(worker, frame, faces, frame_idx, debug):
         )
         
         if should_swap:
+            # 对于SKIP，_safe_swap_face会直接返回原帧
             newf = worker._safe_swap_face(processed_frame, faces_sorted[det_idx], 
                                          src_face, f"GPU{worker.gpu_id}", track_id=tid)
             if newf is not None:
@@ -1528,10 +1988,19 @@ def _process_frame_with_worker(worker, frame, faces, frame_idx, debug):
                 worker._increment_stability(tid)
                 if debug:
                     from core.checkpoint_manager import log_with_time
-                    skip_info = " (SKIP)" if is_skip_track else ""
+                    if worker.swap_all_mode:
+                        skip_info = " (SKIP)" if worker.track_source_map.get(tid) == "SKIP" else ""
+                    else:
+                        skip_info = " (SKIP)" if tid in worker.skip_face_self_faces else ""
                     log_with_time("DEBUG", f"帧{frame_idx} Track{tid}{skip_info} 替换成功 sim={sim:.3f}")
         elif sim > worker.sim_threshold - 0.03:
             worker._increment_stability(tid)
+            # 更新SKIP track的缓存
+            if worker.swap_all_mode and worker.track_source_map.get(tid) == "SKIP":
+                if det_idx < len(faces_sorted):
+                    worker.skip_face_self_faces[tid] = faces_sorted[det_idx]
+        
+        # ... 其余代码保持不变
         
         # 更新track（SKIP和正常都需要）
         old_track = worker.track_embeddings.get(tid, {})
@@ -1545,6 +2014,40 @@ def _process_frame_with_worker(worker, frame, faces, frame_idx, debug):
         
         used_tracks.add(tid)
         used_faces.add(det_idx)
+    
+    # Swap-All模式：处理未匹配的新人脸
+    if worker.swap_all_mode:
+        for det_idx, face in enumerate(faces_sorted):
+            if det_idx in used_faces:
+                continue
+            
+            emb = worker._get_embedding(face)
+            if emb is None:
+                continue
+            
+            # 创建新track，默认换成源脸
+            new_tid = max(worker.track_embeddings.keys()) + 1 if worker.track_embeddings else 0
+            
+            worker.track_embeddings[new_tid] = {
+                "emb": emb,
+                "last_seen": frame_idx,
+                "original_emb": emb.copy(),
+                "history": []
+            }
+            worker.track_source_map[new_tid] = "SWAP"
+            worker.track_stability[new_tid] = 1
+            
+            # 立即换脸
+            # 修正后
+            newf = worker._safe_swap_face(processed_frame, face, worker.swap_all_source_face,
+                             f"GPU{worker.gpu_id} 新人脸",
+                             track_id=new_tid)
+
+            if newf is not None:
+                processed_frame = newf
+                if debug:
+                    from core.checkpoint_manager import log_with_time
+                    log_with_time("DEBUG", f"帧{frame_idx} 新人脸 Track{new_tid} 换脸成功")
     
     # 保留未匹配但未过期的track
     for tid, t in worker.track_embeddings.items():
@@ -1717,7 +2220,8 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                                     max_workers_per_gpu=4,
                                     start_frame=None, end_frame=None,
                                     track_frame=None, extract_only=False,
-                                    encoder='libx264', crf=23, preset='medium'):
+                                    encoder='libx264', crf=23, preset='medium',
+                                    swap_all_mode=False):  # 新增参数
     """直接处理视频,支持断点续传和部分处理"""
     from core.checkpoint_manager import CheckpointManager, log_with_time
     from core.processing_range import ProcessingRange
@@ -1934,7 +2438,8 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                     pixel_boost=pixel_boost,
                     auto_pixel_boost=auto_pixel_boost,
                     frame_resolution=frame_resolution,
-                    debug=debug
+                    debug=debug,
+                    swap_all_mode=swap_all_mode
                 )
                 
                 if not worker.initialize_models():
@@ -1954,28 +2459,60 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                     faces = worker.models["analyser"].get(first_frame)
                     if faces:
                         faces_sorted = sorted(faces, key=lambda x: x.bbox[0])
-                        for i, face in enumerate(faces_sorted):
-                            if i >= len(worker.source_faces):
-                                break
+                        
+                        if swap_all_mode:
+                            # Swap-All模式的初始化
+                            for i, face in enumerate(faces_sorted):
+                                emb = worker._get_embedding(face)
+                                
+                                if emb is None:
+                                    continue
+                                
+                                worker.initial_frame_embeddings[i] = emb.copy()
+                                worker.track_embeddings[i] = {
+                                    "emb": emb,
+                                    "last_seen": track_reference_frame,
+                                    "original_emb": emb.copy(),
+                                    "history": []
+                                }
+                                worker.track_stability[i] = 1
+                                
+                                if i in worker.skip_positions:
+                                    # 跳过位置
+                                    worker.track_source_map[i] = "SKIP"
+                                    worker.skip_face_self_faces[i] = face
+                                    if debug:
+                                        log_with_time("DEBUG", f"{thread_name} Track {i} 设为SKIP（位置{i}）")
+                                else:
+                                    # 换脸位置
+                                    worker.track_source_map[i] = "SWAP"
+                                    if debug:
+                                        log_with_time("DEBUG", f"{thread_name} Track {i} 设为SWAP")
                             
-                            src_face = worker.source_faces[i]
-                            emb = worker._get_embedding(face)
-                            
-                            if emb is None:
-                                continue
-                            
-                            worker.initial_frame_embeddings[i] = emb.copy()
-                            worker.track_embeddings[i] = {
-                                "emb": emb,
-                                "last_seen": track_reference_frame,
-                                "original_emb": emb.copy(),
-                                "history": []
-                            }
-                            worker.track_stability[i] = 1
-                            worker.track_source_map[i] = i
-                            
-                            if src_face is None:
-                                worker.skip_face_self_faces[i] = face
+                        else:
+                            # 正常模式的初始化
+                            for i, face in enumerate(faces_sorted):
+                                if i >= len(worker.source_faces):
+                                    break
+                                
+                                src_face = worker.source_faces[i]
+                                emb = worker._get_embedding(face)
+                                
+                                if emb is None:
+                                    continue
+                                
+                                worker.initial_frame_embeddings[i] = emb.copy()
+                                worker.track_embeddings[i] = {
+                                    "emb": emb,
+                                    "last_seen": track_reference_frame,
+                                    "original_emb": emb.copy(),
+                                    "history": []
+                                }
+                                worker.track_stability[i] = 1
+                                worker.track_source_map[i] = i
+                                
+                                if src_face is None:
+                                    worker.skip_face_self_faces[i] = face
                         
                         worker.initial_mapping_done = True
                 
