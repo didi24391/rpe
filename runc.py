@@ -31,8 +31,6 @@ else:
     import torch
     if not torch.cuda.is_available():
         quit("You are using --gpu flag but CUDA isn't available or properly installed on your system.")
-
-
 import argparse
 import os
 import shutil
@@ -43,10 +41,43 @@ from core.utils import is_img, detect_fps, add_audio, extract_frames, path_safe
 from core.config import get_face, ModelManager
 
 
-def load_source_faces(face_paths, use_hybrid):
-    """加载源人脸"""
+def load_source_faces(face_paths, use_hybrid, swap_all_mode=False, skip_positions=None):
+    """加载源人脸（支持swap-all模式）"""
     from core.config import get_face, get_face_hybrid, get_face_model, is_hybrid_mode
     
+    # swap-all模式：只加载一个源脸用于所有替换
+    if swap_all_mode:
+        if not face_paths or len(face_paths) == 0:
+            print(f"[ERROR] swap-all模式需要提供至少一个源人脸")
+            return None
+        
+        # 加载唯一的源脸
+        swap_face_path = face_paths[0]
+        img = cv2.imread(swap_face_path)
+        if img is None:
+            print(f"[ERROR] 无法读取源图像: {swap_face_path}")
+            return None
+        
+        if is_hybrid_mode() and get_face_model().lower() in ("antelopev2", "buffalo_sc", "buffalo_l"):
+            print(f"[INFO] 使用混合检测模式加载源人脸 ({get_face_model()}+buffalo_l)")
+            swap_face = get_face_hybrid(img)
+        else:
+            swap_face = get_face(img)
+        
+        if swap_face is None:
+            print(f"[ERROR] 源图像中未检测到人脸: {swap_face_path}")
+            return None
+        
+        print(f"[INFO] swap-all模式: 已加载源人脸 ({swap_face_path})")
+        print(f"[INFO] 跳过位置: {skip_positions if skip_positions else '无'}")
+        
+        return {
+            'mode': 'swap_all',
+            'swap_face': swap_face,
+            'skip_positions': skip_positions or []
+        }
+    
+    # 原有的正常模式
     source_faces = []
     for i, f in enumerate(face_paths):
         if f.lower() == "skip":
@@ -59,7 +90,6 @@ def load_source_faces(face_paths, use_hybrid):
             print(f"[ERROR] 无法读取源图像: {f}")
             return None
 
-        # 根据环境变量和参数选择检测方式
         if is_hybrid_mode() and get_face_model().lower() in ("antelopev2", "buffalo_sc", "buffalo_l"):
             print(f"[INFO] 使用混合检测模式加载源人脸 ({get_face_model()}+buffalo_l)")
             face = get_face_hybrid(img)
@@ -76,8 +106,58 @@ def load_source_faces(face_paths, use_hybrid):
     return source_faces
 
 
-def verify_track_frame(target_path, track_frame, source_faces, debug=False):
-    """验证track帧的人脸数量"""
+def verify_track_frame(target_path, track_frame, source_faces, debug=False, swap_all_mode=False):
+    """验证track帧的人脸数量（支持swap-all模式）"""
+    if swap_all_mode:
+        # swap-all模式：只需要验证track帧有人脸即可
+        swap_face = source_faces['swap_face']
+        skip_positions = source_faces['skip_positions']
+        
+        print(f"[INFO] ========================================")
+        print(f"[INFO] Swap-All 模式:")
+        print(f"[INFO]   源人脸: 1个（用于所有替换）")
+        print(f"[INFO]   跳过位置: {skip_positions if skip_positions else '无'}")
+        print(f"[INFO] ========================================")
+        print(f"[INFO] 验证 track 帧...")
+        
+        verify_cap = cv2.VideoCapture(target_path)
+        if not verify_cap.isOpened():
+            print(f"[ERROR] 无法打开视频文件: {target_path}")
+            return False
+        
+        verify_cap.set(cv2.CAP_PROP_POS_FRAMES, track_frame)
+        ret, verify_frame = verify_cap.read()
+        verify_cap.release()
+        
+        if not ret or verify_frame is None:
+            print(f"[ERROR] 无法读取帧 {track_frame}")
+            return False
+        
+        from core.config import get_face_analyser
+        temp_analyser = get_face_analyser()
+        detected_faces = temp_analyser.get(verify_frame)
+        detected_count = len(detected_faces) if detected_faces else 0
+        
+        print(f"[INFO] Track 帧 {track_frame} 检测到 {detected_count} 个人脸")
+        
+        if detected_count == 0:
+            print(f"[ERROR] Track 帧未检测到人脸！")
+            return False
+        
+        # 验证跳过位置是否合法
+        if skip_positions:
+            invalid_positions = [p for p in skip_positions if p >= detected_count]
+            if invalid_positions:
+                print(f"[ERROR] 跳过位置 {invalid_positions} 超出范围（检测到{detected_count}个人脸，索引0-{detected_count-1}）")
+                return False
+        
+        print(f"[SUCCESS] Swap-All 模式验证通过！")
+        print(f"[INFO]   将替换: {detected_count - len(skip_positions)} 个人脸")
+        print(f"[INFO]   将跳过: {len(skip_positions)} 个人脸（位置: {skip_positions}）")
+        print(f"[INFO] ========================================")
+        return True
+    
+    # 原有的正常模式验证逻辑
     total_sources = len(source_faces)
     skip_count = sum(1 for f in source_faces if f is None)
     normal_count = total_sources - skip_count
@@ -94,7 +174,6 @@ def verify_track_frame(target_path, track_frame, source_faces, debug=False):
     print(f"[INFO]   - 如果某个位置不需要换脸，请使用 'skip' 占位")
     print(f"[INFO] ========================================")
     
-    # 验证track帧
     print(f"[INFO] 验证 track 帧的人脸数量...")
     print(f"[INFO] 使用帧 {track_frame} 进行验证")
     
@@ -112,7 +191,6 @@ def verify_track_frame(target_path, track_frame, source_faces, debug=False):
         print(f"[INFO] 提示：视频总帧数可能少于 {track_frame}")
         return False
     
-    # 使用临时检测器检测人脸
     print("[INFO] 正在检测 track 帧的人脸...")
     from core.config import get_face_analyser
     temp_analyser = get_face_analyser()
@@ -122,7 +200,6 @@ def verify_track_frame(target_path, track_frame, source_faces, debug=False):
     print(f"[INFO] Track 帧 {track_frame} 检测到 {detected_count} 个人脸")
     print(f"[INFO] 提供的源人脸数量: {total_sources}")
     
-    # 验证数量是否匹配
     if detected_count != total_sources:
         print(f"[ERROR] ========================================")
         print(f"[ERROR] 人脸数量不匹配！")
@@ -165,13 +242,23 @@ def main(args):
         print(f"[ERROR] 模型准备失败: {e}")
         return
     
+    # 处理swap-all模式
+    swap_all_mode = args.swap_all is not None
+    skip_positions = []
+    if swap_all_mode:
+        skip_positions = [int(p) for p in args.swap_all.split(',') if p.strip()]
+    
     # 加载源人脸
-    source_faces = load_source_faces(args.faces, args.hybrid)
+    source_faces = load_source_faces(args.faces, args.hybrid, swap_all_mode, skip_positions)
     if source_faces is None:
         return
     
     # 图片模式
     if is_img(args.target):
+        if swap_all_mode:
+            print("[ERROR] swap-all模式不支持图片处理")
+            return
+        
         process_img(source_faces, args.target, model_name=args.model, 
                    pixel_boost=args.pixel_boost, auto_pixel_boost=args.auto_pixel_boost,
                    debug=args.debug)
@@ -224,7 +311,7 @@ def main(args):
             verify_frame_idx = 0
         
         # 验证track帧
-        if not verify_track_frame(args.target, verify_frame_idx, source_faces, args.debug):
+        if not verify_track_frame(args.target, verify_frame_idx, source_faces, args.debug, swap_all_mode):
             return
         
         success = process_video_direct_checkpoint(
@@ -248,7 +335,8 @@ def main(args):
             extract_only=args.extract_only,
             encoder=args.encoder,
             crf=args.crf,
-            preset=args.preset
+            preset=args.preset,
+            swap_all_mode=swap_all_mode  # 新增参数
         )
         
         if success:
@@ -259,6 +347,10 @@ def main(args):
     
     # 传统模式
     else:
+        if swap_all_mode:
+            print("[ERROR] swap-all模式不支持传统模式，请使用checkpoint模式")
+            return
+        
         print("[INFO] 使用传统帧处理模式")
         if args.skip_audio:
             print("[INFO] --skip-audio: 将跳过音频添加阶段")
@@ -314,6 +406,11 @@ if __name__ == "__main__":
     parser.add_argument("--keep-fps", action="store_true", help="是否保持原始帧率")
     parser.add_argument("--force-single-gpu", action="store_true", help="强制只用单GPU")
     parser.add_argument("--debug", action="store_true", help="开启调试模式")
+    
+    # Swap-All 模式
+    parser.add_argument("--swap-all", type=str, default=None,
+                       help="启用swap-all模式：除指定位置外的所有人脸都换成同一个源脸。"
+                            "参数为跳过的人脸位置索引（逗号分隔，从0开始），例如: --swap-all 0 表示跳过第1个人脸（从左到右）")
     
     # 音频控制
     parser.add_argument("--skip-audio", action="store_true", help="跳过音频添加阶段，只输出无音频视频")
@@ -402,6 +499,12 @@ if __name__ == "__main__":
     if args.segment_frames < 10:
         print("[ERROR] segment_frames必须大于等于10")
         exit(1)
+    
+    # swap-all模式验证
+    if args.swap_all is not None:
+        if len(args.faces) != 1:
+            print("[ERROR] swap-all模式只需要提供1个源人脸")
+            exit(1)
     
     # 设置全局环境变量供 config.py 使用
     os.environ["FACE_MODEL"] = args.face_model
