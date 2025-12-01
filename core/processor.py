@@ -2361,15 +2361,18 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
     checkpoint.set_encoder_config(encoder=encoder, crf=crf, preset=preset)
     log_with_time("INFO", f"编码器配置: {encoder}, CRF={crf}, Preset={preset}")
 
-    # 获取需要处理的segment列表
-    segments_to_process = checkpoint.get_segments_to_process()
+    # 获取需要处理的segment列表（传入processing_range）
+    segments_to_process = checkpoint.get_segments_to_process(
+        start_frame=processing_range.start_frame,
+        end_frame=processing_range.end_frame
+    )
 
     # 调试信息
     completed_frames, total = checkpoint.get_progress()
     log_with_time("INFO", f"当前进度: {completed_frames}/{total} 帧已完成")
 
     if not segments_to_process:
-        log_with_time("INFO", "所有segment已处理完成，开始合并...")
+        log_with_time("INFO", "处理范围内所有segment已完成，开始合并...")
         if extract_only:
             return merge_and_finalize(checkpoint, target_path, skip_audio, 
                                      processing_range, extract_only)
@@ -2377,12 +2380,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
             return merge_with_original(checkpoint, target_path, output_path, 
                                       processing_range, skip_audio)
 
-    log_with_time("INFO", f"需要处理 {len(segments_to_process)} 个segment:")
-    for seg_idx, start, end in segments_to_process[:5]:
-        log_with_time("INFO", f"  segment_{seg_idx}: 帧 {start} - {end}")
-    if len(segments_to_process) > 5:
-        log_with_time("INFO", f"  ... 还有 {len(segments_to_process) - 5} 个")
-    
+    # 直接使用 segments_to_process，不再进行额外过滤
     resume_frame = segments_to_process[0][1]
     log_with_time("INFO", f"从帧 {resume_frame} 继续处理（处理范围: {processing_range.start_frame} - {processing_range.end_frame}）")
     
