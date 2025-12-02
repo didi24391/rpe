@@ -14,9 +14,10 @@ def log_with_time(level, msg):
 class CheckpointManager:
     """断点续传管理器"""
     
-    def __init__(self, output_path: str, segment_frames: int = 600):
+    def __init__(self, output_path: str, segment_frames: int = 600, debug: bool = False):
         self.output_path = output_path
         self.segment_frames = segment_frames
+        self.debug = debug  # 添加这一行
         
         # 创建临时目录
         self.temp_dir = output_path.replace('.mp4', '_segments')
@@ -232,11 +233,14 @@ class CheckpointManager:
         return (total_frames + self.segment_frames - 1) // self.segment_frames
     
     def get_resume_frame(self, start_frame=None, end_frame=None) -> int:
-        """获取恢复处理的起始帧（使用实际完成的帧数）- 支持processing_range
+        """获取恢复处理的起始帧 - 简化版
         
         Args:
             start_frame: 处理范围起始帧（可选）
             end_frame: 处理范围结束帧（可选）
+        
+        Returns:
+            下一个需要处理的帧号
         """
         if start_frame is None:
             start_frame = 0
@@ -246,7 +250,6 @@ class CheckpointManager:
         completed = self.checkpoint_data.get('completed_segments', {})
         
         if not completed:
-            log_with_time("INFO", f"首次处理，从帧 {start_frame} 开始")
             return start_frame
         
         # 统一键类型
@@ -254,40 +257,23 @@ class CheckpointManager:
         for k, v in completed.items():
             completed_dict[int(k)] = v
         
-        # 按segment索引排序
-        sorted_segments = sorted(completed_dict.keys())
+        # 从start_frame开始，找到第一个未完成的segment
+        current_frame = start_frame
+        seg_idx = start_frame // self.segment_frames
         
-        # 计算每个segment的绝对帧范围
-        segment_ranges = {}
-        current_frame = 0
-        for seg_idx in sorted_segments:
-            actual_frames = completed_dict[seg_idx]
-            segment_ranges[seg_idx] = (current_frame, current_frame + actual_frames)
-            current_frame += actual_frames
+        while current_frame < end_frame:
+            if seg_idx not in completed_dict:
+                # 找到第一个未完成的segment
+                log_with_time("INFO", f"从segment {seg_idx}（帧 {current_frame}）继续处理")
+                return current_frame
+            
+            # 这个segment已完成，移动到下一个
+            current_frame += self.segment_frames
+            seg_idx += 1
         
-        # 如果start_frame在某个已完成segment的范围内，跳到该segment结束
-        for seg_idx in sorted_segments:
-            seg_start, seg_end = segment_ranges[seg_idx]
-            if seg_start <= start_frame < seg_end:
-                # start_frame在这个segment内，从这个segment结束后继续
-                log_with_time("INFO", f"起始帧 {start_frame} 在已完成的segment {seg_idx} 内，从帧 {seg_end} 继续")
-                return seg_end
-        
-        # 如果start_frame之后有连续的已完成segment，跳到最后一个连续segment结束
-        resume_from = start_frame
-        for seg_idx in sorted_segments:
-            seg_start, seg_end = segment_ranges[seg_idx]
-            if seg_start == resume_from:
-                resume_from = seg_end
-            elif seg_start > resume_from:
-                break
-        
-        if resume_from > start_frame:
-            log_with_time("INFO", f"从起始帧 {start_frame} 起有连续完成的segment，从帧 {resume_from} 继续")
-        else:
-            log_with_time("INFO", f"从帧 {start_frame} 开始处理")
-        
-        return resume_from
+        # 所有segment都完成了
+        log_with_time("INFO", "所有segment已完成")
+        return end_frame
     
     def get_next_segment_index(self) -> int:
         """获取下一个segment索引（找到第一个缺失的）"""
@@ -309,7 +295,7 @@ class CheckpointManager:
         return len(sorted_segments)
     
     def get_segments_to_process(self, start_frame=None, end_frame=None) -> List[Tuple[int, int, int]]:
-        """获取需要处理的segment列表（修复版 - 支持processing_range）
+        """获取需要处理的segment列表（修复版 - 不假设连续性）
         
         Args:
             start_frame: 处理范围起始帧（可选）
@@ -332,100 +318,45 @@ class CheckpointManager:
         for k, v in self.checkpoint_data.get('completed_segments', {}).items():
             completed_dict[int(k)] = v
         
-        if not completed_dict:
-            # 没有任何完成的segment，从start_frame开始
-            segments_to_process = []
-            current_frame = start_frame
-            seg_idx = start_frame // self.segment_frames
-            
-            while current_frame < end_frame:
-                seg_end = min(current_frame + self.segment_frames, end_frame)
-                segments_to_process.append((seg_idx, current_frame, seg_end))
-                current_frame = seg_end
-                seg_idx += 1
-            
-            if segments_to_process:
-                log_with_time("INFO", f"首次处理，从帧 {start_frame} 到 {end_frame}")
-            return segments_to_process
-        
-        # 按segment索引排序
-        sorted_segment_ids = sorted(completed_dict.keys())
-        
-        # 计算每个已完成segment的实际帧范围（从0开始的绝对位置）
-        segment_ranges = {}  # {seg_idx: (start_frame, end_frame)}
-        current_frame = 0
-        
-        for seg_idx in sorted_segment_ids:
-            actual_frames = completed_dict[seg_idx]
-            segment_ranges[seg_idx] = (current_frame, current_frame + actual_frames)
-            current_frame += actual_frames
-        
-        total_completed_frames = current_frame
-        log_with_time("INFO", f"已完成 {len(sorted_segment_ids)} 个segment，总计 {total_completed_frames} 帧")
-        
-        # 检查处理范围内是否全部完成
-        if total_completed_frames >= end_frame:
-            # 检查start_frame到end_frame范围内是否有gap
-            range_has_gap = False
-            for frame in range(start_frame, end_frame, self.segment_frames):
-                frame_covered = False
-                for seg_idx in sorted_segment_ids:
-                    seg_start, seg_end = segment_ranges[seg_idx]
-                    if seg_start <= frame < seg_end:
-                        frame_covered = True
-                        break
-                if not frame_covered:
-                    range_has_gap = True
-                    break
-            
-            if not range_has_gap:
-                log_with_time("INFO", f"处理范围 [{start_frame}, {end_frame}) 内所有帧已完成")
-                return []
-        
-        # 找出处理范围内缺失的segment
+        # 计算处理范围内应该有的所有segment
         segments_to_process = []
-        
-        # 方法：遍历处理范围，找出未覆盖的区域
         current_frame = start_frame
         seg_idx = start_frame // self.segment_frames
         
         while current_frame < end_frame:
             seg_end = min(current_frame + self.segment_frames, end_frame)
             
-            # 检查这个范围是否被某个已完成的segment覆盖
-            is_covered = False
-            for completed_seg_idx in sorted_segment_ids:
-                if completed_seg_idx not in segment_ranges:
-                    continue
-                
-                completed_start, completed_end = segment_ranges[completed_seg_idx]
-                
-                # 如果已完成的segment完全覆盖当前范围
-                if completed_start <= current_frame and completed_end >= seg_end:
-                    # 验证文件是否存在
-                    seg_path = self.get_segment_path(completed_seg_idx)
-                    if os.path.exists(seg_path):
-                        file_size = os.path.getsize(seg_path)
-                        if file_size >= 1024:
-                            is_covered = True
-                            seg_idx = completed_seg_idx
-                            current_frame = completed_end
-                            break
-                        else:
-                            log_with_time("WARNING", f"Segment {completed_seg_idx} 文件异常({file_size}B)，重新处理")
-                            self.remove_segment_from_checkpoint(completed_seg_idx)
+            # 检查这个segment是否已完成
+            if seg_idx in completed_dict:
+                # 已完成，验证文件
+                seg_path = self.get_segment_path(seg_idx)
+                if os.path.exists(seg_path):
+                    file_size = os.path.getsize(seg_path)
+                    if file_size >= 1024:
+                        # 文件存在且看起来正常，跳过
+                        if self.debug:
+                            log_with_time("DEBUG", f"Segment {seg_idx} 已完成且文件完整，跳过")
                     else:
-                        log_with_time("WARNING", f"Segment {completed_seg_idx} 文件丢失，重新处理")
-                        self.remove_segment_from_checkpoint(completed_seg_idx)
-            
-            if not is_covered:
-                # 这个范围需要处理
-                segments_to_process.append((seg_idx, current_frame, seg_end))
-                current_frame = seg_end
-                seg_idx += 1
+                        log_with_time("WARNING", f"Segment {seg_idx} 文件异常({file_size}B)，重新处理")
+                        self.remove_segment_from_checkpoint(seg_idx)
+                        segments_to_process.append((seg_idx, current_frame, seg_end))
+                else:
+                    log_with_time("WARNING", f"Segment {seg_idx} 文件丢失，重新处理")
+                    self.remove_segment_from_checkpoint(seg_idx)
+                    segments_to_process.append((seg_idx, current_frame, seg_end))
             else:
-                # 已被覆盖，继续下一段
-                pass
+                # 未完成，需要处理
+                segments_to_process.append((seg_idx, current_frame, seg_end))
+            
+            current_frame = seg_end
+            seg_idx += 1
+        
+        if completed_dict:
+            completed_count = len([s for s in range(start_frame // self.segment_frames, 
+                                                    (end_frame + self.segment_frames - 1) // self.segment_frames)
+                                  if s in completed_dict])
+            total_in_range = (end_frame - start_frame + self.segment_frames - 1) // self.segment_frames
+            log_with_time("INFO", f"处理范围内: 已完成 {completed_count}/{total_in_range} 个segment")
         
         if segments_to_process:
             log_with_time("INFO", f"需要处理 {len(segments_to_process)} 个segment:")
@@ -433,6 +364,8 @@ class CheckpointManager:
                 log_with_time("INFO", f"  segment_{seg_idx}: 帧 {start} - {end}")
             if len(segments_to_process) > 5:
                 log_with_time("INFO", f"  ... 还有 {len(segments_to_process) - 5} 个")
+        else:
+            log_with_time("INFO", "处理范围内所有segment已完成")
         
         return segments_to_process
     
