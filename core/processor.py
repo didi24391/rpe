@@ -2300,7 +2300,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
         log_with_time("WARNING", "psutil未安装，CPU内存分配将使用保守策略")
     
     # 初始化检查点管理器
-    checkpoint = CheckpointManager(output_path, segment_frames)
+    checkpoint = CheckpointManager(output_path, segment_frames, debug=debug)
 
     # 提前检查是否已完成
     if checkpoint.is_fully_completed():
