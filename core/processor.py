@@ -2285,7 +2285,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                                     start_frame=None, end_frame=None,
                                     track_frame=None, extract_only=False,
                                     encoder='libx264', crf=23, preset='medium',
-                                    swap_all_mode=False):  # 新增参数
+                                    swap_all_mode=False):
     """直接处理视频,支持断点续传和部分处理"""
     from core.checkpoint_manager import CheckpointManager, log_with_time
     from core.processing_range import ProcessingRange
@@ -2301,6 +2301,52 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
     
     # 初始化检查点管理器
     checkpoint = CheckpointManager(output_path, segment_frames, debug=debug)
+    # 获取视频信息 - 使用精确帧数检测
+    from core.utils import detect_fps, get_accurate_frame_count
+    
+    log_with_time("INFO", "="*60)
+    log_with_time("INFO", "开始检测视频信息...")
+    
+    # 使用精确方法检测帧数
+    total_frames, detection_method = get_accurate_frame_count(target_path)
+    
+    # 获取其他视频信息
+    cap = cv2.VideoCapture(target_path)
+    opencv_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = detect_fps(target_path)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    
+    # 对比不同方法的结果
+    if detection_method != 'opencv':
+        diff = abs(total_frames - opencv_frame_count)
+        if diff > 0:
+            log_with_time("INFO", f"帧数检测对比:")
+            log_with_time("INFO", f"  {detection_method}: {total_frames} 帧")
+            log_with_time("INFO", f"  opencv:          {opencv_frame_count} 帧")
+            log_with_time("INFO", f"  差异:            {diff} 帧")
+            
+            if diff > 50:
+                log_with_time("WARNING", 
+                    f"检测差异较大({diff}帧)，可能是可变帧率(VFR)视频")
+    log_with_time("INFO", f"最终使用: {total_frames} 帧 (方法: {detection_method})")
+    log_with_time("INFO", f"帧率: {fps:.6f} fps")
+    log_with_time("INFO", f"分辨率: {width}x{height}")
+    log_with_time("INFO", "="*60)
+    
+    frame_resolution = (width, height)
+    
+    # 创建处理范围对象
+    processing_range = ProcessingRange(
+        total_frames, fps, start_frame, end_frame, None, None, track_frame
+    )
+    
+    # 设置视频信息（会自动处理帧数不一致的情况）
+    if extract_only:
+        checkpoint.set_video_info(fps, width, height, processing_range.get_frame_count())
+    else:
+        checkpoint.set_video_info(fps, width, height, total_frames)
 
     # 提前检查是否已完成
     if checkpoint.is_fully_completed():
@@ -2437,18 +2483,54 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
         # 帧读取线程
         def frame_reader_thread():
             reader_cap = cv2.VideoCapture(target_path)
-            frame_idx = resume_frame
+            frame_idx = 0
             
             try:
+                # 如果需要续传，从头跳过已完成的帧
                 if resume_frame > 0:
-                    reader_cap.set(cv2.CAP_PROP_POS_FRAMES, resume_frame)
-                    log_with_time("INFO", f"读取线程从帧 {resume_frame} 开始")
+                    log_with_time("INFO", f"需要跳过前 {resume_frame} 帧（已完成）")
+                    log_with_time("INFO", "为确保准确性，将逐帧跳过...")
+                    
+                    skip_start_time = time.time()
+                    
+                    while frame_idx < resume_frame:
+                        ret, _ = reader_cap.read()
+                        if not ret:
+                            log_with_time("ERROR", f"跳帧失败于帧 {frame_idx}，无法继续")
+                            reading_done.set()
+                            return
+                        
+                        frame_idx += 1
+                        
+                        # 每1000帧报告一次进度
+                        if frame_idx % 1000 == 0:
+                            elapsed = time.time() - skip_start_time
+                            speed = frame_idx / elapsed if elapsed > 0 else 0
+                            remaining = (resume_frame - frame_idx) / speed if speed > 0 else 0
+                            log_with_time("INFO", 
+                                f"跳帧进度: {frame_idx}/{resume_frame} "
+                                f"({frame_idx/resume_frame*100:.1f}%) "
+                                f"速度: {speed:.0f}帧/秒, 预计剩余: {remaining:.0f}秒")
+                    
+                    skip_elapsed = time.time() - skip_start_time
+                    log_with_time("INFO", 
+                        f"✓ 跳帧完成: {resume_frame}帧用时{skip_elapsed:.1f}秒 "
+                        f"(速度: {resume_frame/skip_elapsed:.0f}帧/秒)")
+                    log_with_time("INFO", f"✓ 现在从帧 {frame_idx} 开始实际处理")
+                else:
+                    log_with_time("INFO", "从帧 0 开始读取")
                 
+                # 现在开始实际读取和处理
                 frames_read = 0
+                read_start_frame = frame_idx
+                
                 while frame_idx < processing_range.end_frame and not oom_detected.is_set():
                     ret, frame = reader_cap.read()
                     if not ret:
                         log_with_time("WARNING", f"读取失败于帧 {frame_idx}")
+                        if frames_read > 0:
+                            log_with_time("INFO", 
+                                f"实际读取: 从帧{read_start_frame}到帧{frame_idx-1}, 共{frames_read}帧")
                         break
                     
                     task_queue.put((frame_idx, frame.copy()))
@@ -2461,7 +2543,8 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                 if oom_detected.is_set():
                     log_with_time("ERROR", "检测到OOM,停止读取")
                 else:
-                    log_with_time("INFO", f"读取完成: {frames_read}帧")
+                    log_with_time("INFO", 
+                        f"读取完成: 从帧{read_start_frame}到帧{frame_idx-1}, 共{frames_read}帧")
                 
                 reading_done.set()
                 
@@ -2545,13 +2628,11 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                                 worker.track_stability[i] = 1
                                 
                                 if i in worker.skip_positions:
-                                    # 跳过位置
                                     worker.track_source_map[i] = "SKIP"
                                     worker.skip_face_self_faces[i] = face
                                     if debug:
                                         log_with_time("DEBUG", f"{thread_name} Track {i} 设为SKIP（位置{i}）")
                                 else:
-                                    # 换脸位置
                                     worker.track_source_map[i] = "SWAP"
                                     if debug:
                                         log_with_time("DEBUG", f"{thread_name} Track {i} 设为SWAP")
@@ -2592,6 +2673,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                             break
                         
                         start_time = time.time()
+                        processed_frame = None
                         
                         try:
                             faces = worker.models["analyser"].get(frame)
@@ -2610,24 +2692,35 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                                 processed_frame = frame
                                 failed += 1
                             
-                            result_queue.put((frame_idx, processed_frame))
-                            processed += 1
-                            
                         except Exception as e:
-                            log_with_time("WARNING", f"{thread_name} 帧 {frame_idx} 处理异常: {str(e)[:100]}")
+                            log_with_time("ERROR", f"{thread_name} 帧 {frame_idx} 处理异常: {str(e)[:200]}")
                             if debug:
                                 import traceback
                                 traceback.print_exc()
                             
                             # 使用原帧继续
-                            result_queue.put((frame_idx, frame))
+                            processed_frame = frame
                             failed += 1
                             
                             # 只有OOM才终止
                             if "out of memory" in str(e).lower():
                                 log_with_time("ERROR", f"{thread_name} 检测到OOM，停止处理")
                                 oom_detected.set()
-                                break
+                        
+                        # 关键修改：无论处理成功还是失败，都必须放入结果队列
+                        if processed_frame is not None:
+                            try:
+                                result_queue.put((frame_idx, processed_frame), timeout=5.0)
+                                processed += 1
+                            except queue.Full:
+                                log_with_time("ERROR", f"{thread_name} 结果队列已满，帧 {frame_idx} 可能丢失")
+                                # 即使队列满了，也要尽力放入
+                                result_queue.put((frame_idx, processed_frame))
+                                processed += 1
+                        else:
+                            log_with_time("ERROR", f"{thread_name} 帧 {frame_idx} 处理后为None，使用原帧")
+                            result_queue.put((frame_idx, frame))
+                            failed += 1
                         
                         frame_time = time.time() - start_time
                         total_time += frame_time
@@ -2688,22 +2781,24 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
         # 主线程写入逻辑
         log_with_time("INFO", "主线程开始写入...")
         time.sleep(min(10, 2 * total_workers))  # 等待worker初始化
-        
+
         video_info = checkpoint.checkpoint_data['video_info']
-        
+
         # 使用缓冲区处理乱序帧
         current_segment_idx = segments_to_process[0][0]
         segment_writer = None
         segment_start_frame = segments_to_process[0][1]
         segment_end_frame = segments_to_process[0][2]
-        
+        actual_segment_start = segment_start_frame  # 记录实际开始写入的第一帧
+
         results_buffer = {}
         next_write_idx = segment_start_frame
         consecutive_timeouts = 0
         last_report = time.time()
-        
+        skipped_frames = set()
+
         log_with_time("INFO", f"开始写入，从帧 {segment_start_frame} 到 {processing_range.end_frame}")
-        
+
         while next_write_idx < processing_range.end_frame:
             if oom_detected.is_set():
                 if result_queue.empty() and next_write_idx not in results_buffer:
@@ -2715,8 +2810,18 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                 if segment_writer is not None:
                     # 关闭当前segment
                     actual_written = segment_writer.release()
-                    checkpoint.mark_segment_completed(current_segment_idx, actual_written)
-                    log_with_time("INFO", f"Segment {current_segment_idx} 完成: {actual_written} 帧")
+                    
+                    # 关键修复：使用实际写入的帧范围
+                    actual_frames_written = next_write_idx - actual_segment_start
+                    
+                    log_with_time("INFO", 
+                        f"Segment {current_segment_idx}: "
+                        f"计划帧{segment_start_frame}-{segment_end_frame}, "
+                        f"实际写入帧{actual_segment_start}-{next_write_idx-1}, "
+                        f"写入{actual_frames_written}帧, writer统计{actual_written}帧")
+                    
+                    # 使用实际写入的帧数（以next_write_idx为准）
+                    checkpoint.mark_segment_completed(current_segment_idx, actual_frames_written)
                 
                 # 查找下一个segment
                 found_next = False
@@ -2725,6 +2830,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                         current_segment_idx = seg_idx
                         segment_start_frame = seg_start
                         segment_end_frame = seg_end
+                        actual_segment_start = next_write_idx  # 记录实际开始写入的帧号
                         segment_writer = SegmentWriter(checkpoint, seg_idx, video_info)
                         log_with_time("INFO", f"创建 segment_{seg_idx} (帧 {seg_start} - {seg_end})")
                         found_next = True
@@ -2762,21 +2868,57 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                 except queue.Empty:
                     consecutive_timeouts += 1
                     
-                    max_timeout = 200 if oom_detected.is_set() else 5000
+                    if oom_detected.is_set():
+                        max_timeout = 100
+                    elif reading_done.is_set() and all(not t.is_alive() for t in all_threads):
+                        max_timeout = 50
+                    else:
+                        max_timeout = 5000
                     
                     if consecutive_timeouts > max_timeout:
                         log_with_time("ERROR", f"超时等待帧 {next_write_idx}")
                         log_with_time("ERROR", f"连续超时次数: {consecutive_timeouts}")
                         
-                        if reading_done.is_set() and result_queue.empty():
+                        all_workers_done = reading_done.is_set() and all(not t.is_alive() for t in all_threads)
+                        
+                        if all_workers_done:
                             log_with_time("ERROR", "所有worker已完成,但仍缺少帧!")
+                            
                             if results_buffer:
                                 buffered_frames = sorted(results_buffer.keys())
-                                log_with_time("ERROR", f"Buffer中的帧: {buffered_frames[:20]}")
-                        
-                        break
-                    
-                    continue
+                                log_with_time("WARNING", f"Buffer中的帧: {buffered_frames[:20]}")
+                                
+                                if buffered_frames[0] > next_write_idx:
+                                    log_with_time("ERROR", 
+                                        f"检测到丢帧: 帧{next_write_idx}丢失, "
+                                        f"下一个可用帧: {buffered_frames[0]}")
+                                    
+                                    try:
+                                        recovery_cap = cv2.VideoCapture(target_path)
+                                        recovery_cap.set(cv2.CAP_PROP_POS_FRAMES, next_write_idx)
+                                        ret, recovery_frame = recovery_cap.read()
+                                        recovery_cap.release()
+                                        
+                                        if ret and recovery_frame is not None:
+                                            log_with_time("WARNING", f"从原视频恢复帧 {next_write_idx}")
+                                            processed_frame = recovery_frame
+                                            skipped_frames.add(next_write_idx)
+                                        else:
+                                            log_with_time("ERROR", f"无法从原视频恢复帧 {next_write_idx}，跳过")
+                                            next_write_idx += 1
+                                            continue
+                                    except Exception as e:
+                                        log_with_time("ERROR", f"恢复帧失败: {e}，跳过")
+                                        next_write_idx += 1
+                                        continue
+                                else:
+                                    break
+                            else:
+                                break
+                        else:
+                            continue
+                    else:
+                        continue
             
             # 写入帧
             if processed_frame is not None:
@@ -2808,6 +2950,21 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                     f"写入: {next_write_idx}/{processing_range.end_frame} ({progress:.1f}%) | "
                     f"Buffer: {len(results_buffer)} | {' '.join(summary)}")
                 last_report = now
+
+        # 关闭最后的segment
+        if segment_writer is not None:
+            actual_written = segment_writer.release()
+            actual_frames_written = next_write_idx - actual_segment_start
+            
+            log_with_time("INFO", 
+                f"最后 segment {current_segment_idx}: "
+                f"实际写入帧{actual_segment_start}-{next_write_idx-1}, "
+                f"写入{actual_frames_written}帧")
+            
+            checkpoint.mark_segment_completed(current_segment_idx, actual_frames_written)
+
+        if skipped_frames:
+            log_with_time("WARNING", f"共有 {len(skipped_frames)} 帧从原视频恢复: {sorted(skipped_frames)[:20]}")
         
         # 关闭最后的segment
         if segment_writer is not None:
