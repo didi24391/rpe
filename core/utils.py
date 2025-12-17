@@ -118,3 +118,51 @@ def frame_to_time(frame_num, fps):
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
     return f"{minutes:02d}:{seconds:06.3f}"
+def get_accurate_frame_count(video_path):
+    """获取精确的视频帧数（优先使用ffprobe）
+    
+    Returns:
+        (frame_count, method) - 帧数和检测方法
+    """
+    import subprocess
+    
+    # 方法1: ffprobe的nb_read_packets（最准确，逐包计数）
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0', 
+             '-count_packets', '-show_entries', 'stream=nb_read_packets', 
+             '-of', 'csv=p=0', video_path],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            ffprobe_count = int(result.stdout.strip())
+            print(f"[INFO] ffprobe精确计数: {ffprobe_count} 帧")
+            return ffprobe_count, 'ffprobe_packets'
+    except Exception as e:
+        print(f"[WARNING] ffprobe计数失败: {e}")
+    
+    # 方法2: ffprobe的nb_frames（次优）
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0', 
+             '-show_entries', 'stream=nb_frames', 
+             '-of', 'csv=p=0', video_path],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            ffprobe_frames = int(result.stdout.strip())
+            print(f"[INFO] ffprobe nb_frames: {ffprobe_frames} 帧")
+            return ffprobe_frames, 'ffprobe_frames'
+    except Exception as e:
+        print(f"[WARNING] ffprobe nb_frames失败: {e}")
+    
+    # 方法3: OpenCV（不准确，尤其是VFR视频）
+    try:
+        cap = cv2.VideoCapture(video_path)
+        opencv_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        print(f"[WARNING] 使用OpenCV检测（可能不准确）: {opencv_count} 帧")
+        return opencv_count, 'opencv'
+    except Exception as e:
+        print(f"[ERROR] OpenCV检测失败: {e}")
+        return 0, 'failed'
