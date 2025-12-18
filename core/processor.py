@@ -2486,37 +2486,109 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
             frame_idx = 0
             
             try:
-                # 如果需要续传，从头跳过已完成的帧
                 if resume_frame > 0:
-                    log_with_time("INFO", f"需要跳过前 {resume_frame} 帧（已完成）")
-                    log_with_time("INFO", "为确保准确性，将逐帧跳过...")
+                    log_with_time("INFO", f"需要续传，目标起始帧: {resume_frame}")
                     
-                    skip_start_time = time.time()
+                    # 策略1: 先尝试seek（快速但可能不准）
+                    log_with_time("INFO", "尝试使用seek快速定位...")
+                    reader_cap.set(cv2.CAP_PROP_POS_FRAMES, resume_frame)
+                    actual_pos = int(reader_cap.get(cv2.CAP_PROP_POS_FRAMES))
                     
-                    while frame_idx < resume_frame:
-                        ret, _ = reader_cap.read()
-                        if not ret:
-                            log_with_time("ERROR", f"跳帧失败于帧 {frame_idx}，无法继续")
-                            reading_done.set()
-                            return
+                    log_with_time("INFO", f"Seek结果: 请求帧{resume_frame}, 实际到达帧{actual_pos}")
+                    
+                    seek_diff = actual_pos - resume_frame
+                    
+                    if seek_diff == 0:
+                        # Seek完全准确
+                        log_with_time("INFO", "✓ Seek准确，直接从此位置开始")
+                        frame_idx = actual_pos
                         
-                        frame_idx += 1
-                        
-                        # 每1000帧报告一次进度
-                        if frame_idx % 1000 == 0:
-                            elapsed = time.time() - skip_start_time
-                            speed = frame_idx / elapsed if elapsed > 0 else 0
-                            remaining = (resume_frame - frame_idx) / speed if speed > 0 else 0
+                    elif abs(seek_diff) <= 100:
+                        # Seek偏差较小（±100帧以内）
+                        if seek_diff > 0:
+                            # Seek过头了，需要重新定位
+                            log_with_time("WARNING", 
+                                f"Seek过头{seek_diff}帧，从头跳过{resume_frame}帧以确保准确")
+                            reader_cap.release()
+                            reader_cap = cv2.VideoCapture(target_path)
+                            
+                            # 从头跳到目标位置
+                            skip_start = time.time()
+                            for i in range(resume_frame):
+                                ret, _ = reader_cap.read()
+                                if not ret:
+                                    log_with_time("ERROR", f"跳帧失败于帧 {i}")
+                                    reading_done.set()
+                                    return
+                                
+                                if (i + 1) % 5000 == 0:
+                                    elapsed = time.time() - skip_start
+                                    speed = (i + 1) / elapsed
+                                    remaining = (resume_frame - i - 1) / speed if speed > 0 else 0
+                                    log_with_time("INFO", 
+                                        f"跳帧进度: {i+1}/{resume_frame} ({(i+1)/resume_frame*100:.1f}%) "
+                                        f"速度: {speed:.0f}帧/秒, 预计剩余: {remaining:.0f}秒")
+                            
+                            frame_idx = resume_frame
+                            skip_elapsed = time.time() - skip_start
                             log_with_time("INFO", 
-                                f"跳帧进度: {frame_idx}/{resume_frame} "
-                                f"({frame_idx/resume_frame*100:.1f}%) "
-                                f"速度: {speed:.0f}帧/秒, 预计剩余: {remaining:.0f}秒")
+                                f"✓ 精确跳帧完成: {resume_frame}帧用时{skip_elapsed:.1f}秒")
+                            
+                        else:
+                            # Seek不够远，只需补充跳过差额部分
+                            log_with_time("INFO", 
+                                f"Seek差{-seek_diff}帧，逐帧跳过差额部分...")
+                            
+                            frame_idx = actual_pos
+                            skip_start = time.time()
+                            
+                            while frame_idx < resume_frame:
+                                ret, _ = reader_cap.read()
+                                if not ret:
+                                    log_with_time("ERROR", f"补充跳帧失败于帧 {frame_idx}")
+                                    reading_done.set()
+                                    return
+                                frame_idx += 1
+                            
+                            skip_elapsed = time.time() - skip_start
+                            log_with_time("INFO", 
+                                f"✓ 补充跳过{-seek_diff}帧完成，用时{skip_elapsed:.2f}秒")
+                        
+                    else:
+                        # Seek偏差很大（>100帧），不可信，从头跳
+                        log_with_time("WARNING", 
+                            f"⚠️ Seek偏差过大({seek_diff}帧)，可能是VFR视频")
+                        log_with_time("INFO", "为确保准确，将从头逐帧跳过...")
+                        
+                        reader_cap.release()
+                        reader_cap = cv2.VideoCapture(target_path)
+                        
+                        skip_start = time.time()
+                        frame_idx = 0
+                        
+                        while frame_idx < resume_frame:
+                            ret, _ = reader_cap.read()
+                            if not ret:
+                                log_with_time("ERROR", f"跳帧失败于帧 {frame_idx}")
+                                reading_done.set()
+                                return
+                            
+                            frame_idx += 1
+                            
+                            if frame_idx % 5000 == 0:
+                                elapsed = time.time() - skip_start
+                                speed = frame_idx / elapsed
+                                remaining = (resume_frame - frame_idx) / speed if speed > 0 else 0
+                                log_with_time("INFO", 
+                                    f"跳帧进度: {frame_idx}/{resume_frame} ({frame_idx/resume_frame*100:.1f}%) "
+                                    f"速度: {speed:.0f}帧/秒, 预计剩余: {remaining:.0f}秒")
+                        
+                        skip_elapsed = time.time() - skip_start
+                        log_with_time("INFO", 
+                            f"✓ 完整跳帧完成: {resume_frame}帧用时{skip_elapsed:.1f}秒 "
+                            f"(速度: {resume_frame/skip_elapsed:.0f}帧/秒)")
                     
-                    skip_elapsed = time.time() - skip_start_time
-                    log_with_time("INFO", 
-                        f"✓ 跳帧完成: {resume_frame}帧用时{skip_elapsed:.1f}秒 "
-                        f"(速度: {resume_frame/skip_elapsed:.0f}帧/秒)")
-                    log_with_time("INFO", f"✓ 现在从帧 {frame_idx} 开始实际处理")
+                    log_with_time("INFO", f"✓ 准确定位完成，从帧 {frame_idx} 开始处理")
                 else:
                     log_with_time("INFO", "从帧 0 开始读取")
                 
