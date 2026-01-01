@@ -2285,7 +2285,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                                     start_frame=None, end_frame=None,
                                     track_frame=None, extract_only=False,
                                     encoder='libx264', crf=23, preset='medium',
-                                    swap_all_mode=False):
+                                    swap_all_mode=False, no_merge=False):  # 添加 no_merge 参数
     """直接处理视频,支持断点续传和部分处理"""
     from core.checkpoint_manager import CheckpointManager, log_with_time
     from core.processing_range import ProcessingRange
@@ -3076,7 +3076,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                 pct = 0.0
             
             log_with_time("INFO", f"GPU {gid}: {total_proc}帧({pct:.1f}%) | 平均{avg:.0f}ms/帧")
-        
+
         # OOM情况下的处理
         if oom_detected.is_set():
             completed_frames = checkpoint.get_progress()[0]
@@ -3085,6 +3085,17 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
             log_with_time("INFO", 
                 f"进度已保存,建议用更少worker恢复: --max-workers-per-gpu {max(1, max_workers_per_gpu-1)}")
             return False
+        
+        # 新增：检查是否需要跳过合并
+        if no_merge:
+            log_with_time("INFO", "=" * 60)
+            log_with_time("INFO", "所有帧处理完成")
+            log_with_time("INFO", f"--no-merge: 跳过合并阶段，保留临时文件")
+            log_with_time("INFO", f"临时文件位置: {checkpoint.temp_dir}")
+            log_with_time("INFO", f"Segment文件: {checkpoint.temp_dir}/segment_*.mp4")
+            log_with_time("INFO", "=" * 60)
+            log_with_time("INFO", "如需合并，请去掉 --no-merge 参数重新运行")
+            return True
         
         # 合并
         log_with_time("INFO", "所有帧处理完成，开始合并分段...")
