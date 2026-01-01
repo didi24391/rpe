@@ -305,7 +305,8 @@ def main(args):
             encoder=args.encoder,
             crf=args.crf,
             preset=args.preset,
-            swap_all_mode=swap_all_mode  # 新增参数
+            swap_all_mode=swap_all_mode,
+            no_merge=args.no_merge  # 新增参数
         )
         
         if success:
@@ -449,6 +450,8 @@ if __name__ == "__main__":
     # Worker数量
     parser.add_argument("--max-workers-per-gpu", type=int, default=4,
                        help="每个GPU最大worker数量（默认4，自动计算时的上限）")
+    parser.add_argument("--no-merge", action="store_true",
+                       help="只处理帧并保存segment，不进行合并和音频添加（保留临时文件）")
     
     args = parser.parse_args()
     
