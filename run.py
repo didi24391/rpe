@@ -1,36 +1,5 @@
 #!/usr/bin/env python3
 # run.py
-#以下内容到import argparse之前为在colab上面运行所需要增加代码
-import os
-
-# ------------------------
-# 强制 matplotlib 使用 Agg 后端，避免 notebook 专用后端报错
-# 必须在 import matplotlib 之前执行
-# ------------------------
-os.environ['MPLBACKEND'] = 'Agg'
-
-import matplotlib
-matplotlib.use('Agg')
-
-# ------------------------
-# 系统相关 & GPU 检测
-# ------------------------
-import sys
-import time
-import shutil
-
-import core.globals  # 注意：onnxruntime 会在这里被导入
-
-if not shutil.which('ffmpeg'):
-    print('ffmpeg is not installed. Read the docs: https://github.com/s0md3v/roop#installation.\n' * 10)
-    quit()
-
-if '--gpu' not in sys.argv:
-    core.globals.providers = ['CPUExecutionProvider']
-else:
-    import torch
-    if not torch.cuda.is_available():
-        quit("You are using --gpu flag but CUDA isn't available or properly installed on your system.")
 import argparse
 import os
 import shutil
