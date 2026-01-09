@@ -2868,6 +2868,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
         consecutive_timeouts = 0
         last_report = time.time()
         skipped_frames = set()
+        last_progress_frame = next_write_idx  # 用于检测是否有进度
 
         log_with_time("INFO", f"开始写入，从帧 {segment_start_frame} 到 {processing_range.end_frame}")
 
@@ -2883,7 +2884,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                     # 关闭当前segment
                     actual_written = segment_writer.release()
                     
-                    # 关键修复：使用实际写入的帧范围
+                    # 使用实际写入的帧范围
                     actual_frames_written = next_write_idx - actual_segment_start
                     
                     log_with_time("INFO", 
@@ -2892,7 +2893,6 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                         f"实际写入帧{actual_segment_start}-{next_write_idx-1}, "
                         f"写入{actual_frames_written}帧, writer统计{actual_written}帧")
                     
-                    # 使用实际写入的帧数（以next_write_idx为准）
                     checkpoint.mark_segment_completed(current_segment_idx, actual_frames_written)
                 
                 # 查找下一个segment
@@ -2902,7 +2902,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                         current_segment_idx = seg_idx
                         segment_start_frame = seg_start
                         segment_end_frame = seg_end
-                        actual_segment_start = next_write_idx  # 记录实际开始写入的帧号
+                        actual_segment_start = next_write_idx
                         segment_writer = SegmentWriter(checkpoint, seg_idx, video_info)
                         log_with_time("INFO", f"创建 segment_{seg_idx} (帧 {seg_start} - {seg_end})")
                         found_next = True
@@ -2940,12 +2940,13 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                 except queue.Empty:
                     consecutive_timeouts += 1
                     
+                    # 动态计算超时阈值
                     if oom_detected.is_set():
-                        max_timeout = 100
+                        max_timeout = 100  # OOM时快速失败
                     elif reading_done.is_set() and all(not t.is_alive() for t in all_threads):
-                        max_timeout = 50
+                        max_timeout = 50   # 所有worker完成时快速失败
                     else:
-                        max_timeout = 5000
+                        max_timeout = 1000  # 正常处理时给更多时间
                     
                     if consecutive_timeouts > max_timeout:
                         log_with_time("ERROR", f"超时等待帧 {next_write_idx}")
@@ -2954,7 +2955,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                         all_workers_done = reading_done.is_set() and all(not t.is_alive() for t in all_threads)
                         
                         if all_workers_done:
-                            log_with_time("ERROR", "所有worker已完成,但仍缺少帧!")
+                            log_with_time("ERROR", "所有worker已完成，但仍缺少帧！")
                             
                             if results_buffer:
                                 buffered_frames = sorted(results_buffer.keys())
@@ -2965,6 +2966,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                                         f"检测到丢帧: 帧{next_write_idx}丢失, "
                                         f"下一个可用帧: {buffered_frames[0]}")
                                     
+                                    # 尝试从原视频恢复
                                     try:
                                         recovery_cap = cv2.VideoCapture(target_path)
                                         recovery_cap.set(cv2.CAP_PROP_POS_FRAMES, next_write_idx)
@@ -2975,19 +2977,28 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                                             log_with_time("WARNING", f"从原视频恢复帧 {next_write_idx}")
                                             processed_frame = recovery_frame
                                             skipped_frames.add(next_write_idx)
+                                            consecutive_timeouts = 0  # 重置计数
                                         else:
-                                            log_with_time("ERROR", f"无法从原视频恢复帧 {next_write_idx}，跳过")
-                                            next_write_idx += 1
-                                            continue
+                                            log_with_time("ERROR", f"无法从原视频恢复帧 {next_write_idx}")
+                                            log_with_time("ERROR", "停止处理，保存当前进度")
+                                            break
                                     except Exception as e:
-                                        log_with_time("ERROR", f"恢复帧失败: {e}，跳过")
-                                        next_write_idx += 1
-                                        continue
+                                        log_with_time("ERROR", f"恢复帧失败: {e}")
+                                        log_with_time("ERROR", "停止处理，保存当前进度")
+                                        break
                                 else:
+                                    log_with_time("ERROR", "无法确定丢失的帧，停止处理")
                                     break
                             else:
+                                log_with_time("ERROR", "Buffer为空且所有worker已完成，停止处理")
                                 break
                         else:
+                            # Worker还在运行，但长时间没有进度
+                            if consecutive_timeouts % 100 == 0:
+                                log_with_time("WARNING", 
+                                    f"等待帧 {next_write_idx} 已超时 {consecutive_timeouts} 次，"
+                                    f"reader_done={reading_done.is_set()}, "
+                                    f"active_workers={sum(1 for t in all_threads if t.is_alive())}")
                             continue
                     else:
                         continue
@@ -3001,6 +3012,7 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                 
                 if segment_writer.write(processed_frame, next_write_idx):
                     next_write_idx += 1
+                    last_progress_frame = next_write_idx  # 更新进度
                 else:
                     log_with_time("ERROR", f"写入帧 {next_write_idx} 失败!")
                     break
@@ -3038,12 +3050,6 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
         if skipped_frames:
             log_with_time("WARNING", f"共有 {len(skipped_frames)} 帧从原视频恢复: {sorted(skipped_frames)[:20]}")
         
-        # 关闭最后的segment
-        if segment_writer is not None:
-            actual_written = segment_writer.release()
-            checkpoint.mark_segment_completed(current_segment_idx, actual_written)
-            log_with_time("INFO", f"最后 segment {current_segment_idx}: {actual_written} 帧")
-        
         # 等待线程
         log_with_time("INFO", "等待工作线程结束...")
         reader_thread.join(timeout=10)
@@ -3076,7 +3082,14 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                 pct = 0.0
             
             log_with_time("INFO", f"GPU {gid}: {total_proc}帧({pct:.1f}%) | 平均{avg:.0f}ms/帧")
-
+        
+        # 检查是否成功完成
+        if next_write_idx < processing_range.end_frame:
+            log_with_time("WARNING", 
+                f"处理未完成: 已写入 {next_write_idx} 帧，目标 {processing_range.end_frame} 帧")
+            log_with_time("INFO", "进度已保存，可以重新运行继续处理")
+            return False
+        
         # OOM情况下的处理
         if oom_detected.is_set():
             completed_frames = checkpoint.get_progress()[0]
@@ -3085,6 +3098,8 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
             log_with_time("INFO", 
                 f"进度已保存,建议用更少worker恢复: --max-workers-per-gpu {max(1, max_workers_per_gpu-1)}")
             return False
+
+        
         
         # 新增：检查是否需要跳过合并
         if no_merge:
