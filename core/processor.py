@@ -176,8 +176,47 @@ class SegmentWriter:
         self.ffmpeg_process = None
         self._start_ffmpeg_pipe()
 
+    def _get_fps_rational(self, fps):
+        """将浮点数帧率转换为精确的分数表示
+        
+        Args:
+            fps: 浮点数帧率（如 29.97, 23.976）
+        
+        Returns:
+            字符串形式的分数（如 "30000/1001", "24000/1001"）
+        """
+        from fractions import Fraction
+        
+        # 常见的帧率映射
+        common_fps = {
+            23.976: "24000/1001",
+            24.0: "24/1",
+            25.0: "25/1",
+            29.97: "30000/1001",
+            30.0: "30/1",
+            50.0: "50/1",
+            59.94: "60000/1001",
+            60.0: "60/1",
+        }
+        
+        # 检查是否是常见帧率（允许0.01的误差）
+        for known_fps, rational in common_fps.items():
+            if abs(fps - known_fps) < 0.01:
+                return rational
+        
+        # 对于非标准帧率，使用 Fraction 自动转换
+        try:
+            # 限制分母最大值，避免产生过大的数字
+            frac = Fraction(fps).limit_denominator(10000)
+            rational = f"{frac.numerator}/{frac.denominator}"
+            return rational
+        except:
+            # 降级：直接使用浮点数（可能不精确）
+            log_with_time("WARNING", f"无法转换帧率 {fps}，使用浮点数表示")
+            return str(fps)
+
     def _start_ffmpeg_pipe(self):
-        """启动 ffmpeg pipe 进程"""
+        """启动 ffmpeg pipe 进程 - 修复版（显式设置timebase）"""
         width = self.video_info['width']
         height = self.video_info['height']
         fps = self.video_info['fps']
@@ -200,11 +239,19 @@ class SegmentWriter:
             log_with_time("WARNING", f"无法检测编码器: {e}，使用默认 libx264")
             encoder = 'libx264'
         
+        # 计算精确的帧率分数
+        fps_rational = self._get_fps_rational(fps)
+        
         # ffmpeg 命令：从 stdin 读取原始帧
         cmd = [
-            'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-            '-s', f'{width}x{height}', '-pix_fmt', 'bgr24', '-r', str(fps),
-            '-i', '-', '-c:v', encoder,
+            'ffmpeg', '-y', 
+            '-f', 'rawvideo', 
+            '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}', 
+            '-pix_fmt', 'bgr24', 
+            '-r', fps_rational,  # 使用精确的帧率分数
+            '-i', '-', 
+            '-c:v', encoder,
         ]
         
         # 根据编码器类型添加不同的参数
@@ -217,7 +264,13 @@ class SegmentWriter:
         else:  # libx264
             cmd.extend(['-crf', str(crf), '-preset', preset])
         
-        cmd.extend(['-pix_fmt', 'yuv420p', '-movflags', '+faststart', self.segment_path])
+        # ===== 关键修复：显式设置 timebase =====
+        cmd.extend([
+            '-pix_fmt', 'yuv420p',
+            '-video_track_timescale', '10240',  # 强制使用标准的 timebase
+            '-movflags', '+faststart',
+            self.segment_path
+        ])
         
         try:
             self.ffmpeg_process = subprocess.Popen(
