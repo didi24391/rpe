@@ -37,8 +37,16 @@ def load_source_faces(face_paths, use_hybrid, swap_all_mode=False, skip_position
             print(f"[ERROR] 源图像中未检测到人脸: {swap_face_path}")
             return None
         
-        print(f"[INFO] swap-all模式: 已加载源人脸 ({swap_face_path})")
-        print(f"[INFO] 跳过位置: {skip_positions if skip_positions else '无'}")
+        print(f"[INFO] ========================================")
+        print(f"[INFO] Swap-All 模式已启用")
+        print(f"[INFO] 源人脸: {swap_face_path}")
+        if skip_positions:
+            print(f"[INFO] 跳过位置: {skip_positions} (共 {len(skip_positions)} 个)")
+            print(f"[INFO] 其他所有人脸将被替换")
+        else:
+            print(f"[INFO] 跳过位置: 无")
+            print(f"[INFO] 所有检测到的人脸都将被替换")
+        print(f"[INFO] ========================================")
         
         return {
             'mode': 'swap_all',
@@ -83,9 +91,12 @@ def verify_track_frame(target_path, track_frame, source_faces, debug=False, swap
         skip_positions = source_faces['skip_positions']
         
         print(f"[INFO] ========================================")
-        print(f"[INFO] Swap-All 模式:")
+        print(f"[INFO] Swap-All 模式验证:")
         print(f"[INFO]   源人脸: 1个（用于所有替换）")
-        print(f"[INFO]   跳过位置: {skip_positions if skip_positions else '无'}")
+        if skip_positions:
+            print(f"[INFO]   跳过位置: {skip_positions} (共 {len(skip_positions)} 个)")
+        else:
+            print(f"[INFO]   跳过位置: 无（所有人脸都将被替换）")
         print(f"[INFO] ========================================")
         print(f"[INFO] 验证 track 帧...")
         
@@ -119,10 +130,17 @@ def verify_track_frame(target_path, track_frame, source_faces, debug=False, swap
             if invalid_positions:
                 print(f"[ERROR] 跳过位置 {invalid_positions} 超出范围（检测到{detected_count}个人脸，索引0-{detected_count-1}）")
                 return False
+            
+            swap_count = detected_count - len(skip_positions)
+            print(f"[SUCCESS] Swap-All 模式验证通过！")
+            print(f"[INFO]   检测到人脸: {detected_count} 个")
+            print(f"[INFO]   将替换: {swap_count} 个人脸")
+            print(f"[INFO]   将跳过: {len(skip_positions)} 个人脸（位置: {skip_positions}）")
+        else:
+            print(f"[SUCCESS] Swap-All 模式验证通过！")
+            print(f"[INFO]   检测到人脸: {detected_count} 个")
+            print(f"[INFO]   将替换所有 {detected_count} 个人脸")
         
-        print(f"[SUCCESS] Swap-All 模式验证通过！")
-        print(f"[INFO]   将替换: {detected_count - len(skip_positions)} 个人脸")
-        print(f"[INFO]   将跳过: {len(skip_positions)} 个人脸（位置: {skip_positions}）")
         print(f"[INFO] ========================================")
         return True
     
@@ -214,8 +232,21 @@ def main(args):
     # 处理swap-all模式
     swap_all_mode = args.swap_all is not None
     skip_positions = []
+    
     if swap_all_mode:
-        skip_positions = [int(p) for p in args.swap_all.split(',') if p.strip()]
+        # 解析跳过位置（支持空字符串，表示不跳过任何人脸）
+        if args.swap_all.strip():  # 如果提供了跳过位置
+            try:
+                skip_positions = [int(p.strip()) for p in args.swap_all.split(',') if p.strip()]
+                # 验证位置是否有效（非负整数）
+                if any(p < 0 for p in skip_positions):
+                    print("[ERROR] 跳过位置必须是非负整数")
+                    return
+            except ValueError:
+                print("[ERROR] 跳过位置格式错误，应该是逗号分隔的数字，例如: 0,2,3")
+                return
+        else:  # 空字符串，不跳过任何人脸
+            skip_positions = []
     
     # 加载源人脸
     source_faces = load_source_faces(args.faces, args.hybrid, swap_all_mode, skip_positions)
@@ -306,7 +337,7 @@ def main(args):
             crf=args.crf,
             preset=args.preset,
             swap_all_mode=swap_all_mode,
-            no_merge=args.no_merge  # 新增参数
+            no_merge=args.no_merge
         )
         
         if success:
@@ -377,10 +408,12 @@ if __name__ == "__main__":
     parser.add_argument("--force-single-gpu", action="store_true", help="强制只用单GPU")
     parser.add_argument("--debug", action="store_true", help="开启调试模式")
     
-    # Swap-All 模式
-    parser.add_argument("--swap-all", type=str, default=None,
-                       help="启用swap-all模式：除指定位置外的所有人脸都换成同一个源脸。"
-                            "参数为跳过的人脸位置索引（逗号分隔，从0开始），例如: --swap-all 0 表示跳过第1个人脸（从左到右）")
+    # Swap-All 模式（改进版）
+    parser.add_argument("--swap-all", type=str, default=None, nargs='?', const='',
+                       help="启用swap-all模式：用一个源脸替换视频中的所有（或部分）人脸。"
+                            "可选参数为跳过的人脸位置索引（逗号分隔，从0开始）。"
+                            "例如: --swap-all 0,2 表示跳过位置0和2的人脸，替换其他所有人脸；"
+                            "--swap-all 表示替换所有人脸，不跳过任何位置")
     
     # 音频控制
     parser.add_argument("--skip-audio", action="store_true", help="跳过音频添加阶段，只输出无音频视频")
@@ -450,6 +483,8 @@ if __name__ == "__main__":
     # Worker数量
     parser.add_argument("--max-workers-per-gpu", type=int, default=4,
                        help="每个GPU最大worker数量（默认4，自动计算时的上限）")
+    
+    # 新增：不合并参数
     parser.add_argument("--no-merge", action="store_true",
                        help="只处理帧并保存segment，不进行合并和音频添加（保留临时文件）")
     
