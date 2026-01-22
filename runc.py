@@ -69,12 +69,23 @@ def load_source_faces(face_paths, use_hybrid, swap_all_mode=False, skip_position
             return None
         
         print(f"[INFO] swap-all模式: 已加载源人脸 ({swap_face_path})")
-        print(f"[INFO] 跳过位置: {skip_positions if skip_positions else '无'}")
+        
+        # 处理跳过位置：支持 -1 表示不跳过任何人脸
+        if skip_positions is None:
+            skip_positions = []
+        
+        # 检查是否包含 -1（表示全部替换，不跳过任何人脸）
+        if -1 in skip_positions:
+            print(f"[INFO] 跳过位置: -1（不跳过任何人脸，全部替换）")
+            skip_positions = [-1]  # 统一格式
+        else:
+            # 多个跳过位置（已支持）
+            print(f"[INFO] 跳过位置: {skip_positions if skip_positions else '无'}")
         
         return {
             'mode': 'swap_all',
             'swap_face': swap_face,
-            'skip_positions': skip_positions or []
+            'skip_positions': skip_positions
         }
     
     # 原有的正常模式
@@ -105,7 +116,6 @@ def load_source_faces(face_paths, use_hybrid, swap_all_mode=False, skip_position
     
     return source_faces
 
-
 def verify_track_frame(target_path, track_frame, source_faces, debug=False, swap_all_mode=False):
     """验证track帧的人脸数量（支持swap-all模式）"""
     if swap_all_mode:
@@ -116,7 +126,13 @@ def verify_track_frame(target_path, track_frame, source_faces, debug=False, swap
         print(f"[INFO] ========================================")
         print(f"[INFO] Swap-All 模式:")
         print(f"[INFO]   源人脸: 1个（用于所有替换）")
-        print(f"[INFO]   跳过位置: {skip_positions if skip_positions else '无'}")
+        
+        # 处理跳过位置显示
+        if skip_positions == [-1]:
+            print(f"[INFO]   跳过位置: -1（不跳过任何人脸，全部替换）")
+        else:
+            print(f"[INFO]   跳过位置: {skip_positions if skip_positions else '无'}")
+        
         print(f"[INFO] ========================================")
         print(f"[INFO] 验证 track 帧...")
         
@@ -144,16 +160,23 @@ def verify_track_frame(target_path, track_frame, source_faces, debug=False, swap
             print(f"[ERROR] Track 帧未检测到人脸！")
             return False
         
-        # 验证跳过位置是否合法
-        if skip_positions:
+        # 验证跳过位置是否合法（-1 除外）
+        if skip_positions and skip_positions != [-1]:
             invalid_positions = [p for p in skip_positions if p >= detected_count]
             if invalid_positions:
                 print(f"[ERROR] 跳过位置 {invalid_positions} 超出范围（检测到{detected_count}个人脸，索引0-{detected_count-1}）")
                 return False
         
         print(f"[SUCCESS] Swap-All 模式验证通过！")
-        print(f"[INFO]   将替换: {detected_count - len(skip_positions)} 个人脸")
-        print(f"[INFO]   将跳过: {len(skip_positions)} 个人脸（位置: {skip_positions}）")
+        
+        if skip_positions == [-1]:
+            print(f"[INFO]   将替换: {detected_count} 个人脸（全部）")
+            print(f"[INFO]   将跳过: 0 个人脸")
+        else:
+            skip_count = len(skip_positions) if skip_positions else 0
+            print(f"[INFO]   将替换: {detected_count - skip_count} 个人脸")
+            print(f"[INFO]   将跳过: {skip_count} 个人脸（位置: {skip_positions}）")
+        
         print(f"[INFO] ========================================")
         return True
     
@@ -246,7 +269,12 @@ def main(args):
     swap_all_mode = args.swap_all is not None
     skip_positions = []
     if swap_all_mode:
-        skip_positions = [int(p) for p in args.swap_all.split(',') if p.strip()]
+        # 支持 -1 表示不跳过任何人脸（全部替换）
+        if args.swap_all.strip() == "-1":
+            skip_positions = [-1]
+        else:
+            # 支持多个位置（逗号分隔）
+            skip_positions = [int(p) for p in args.swap_all.split(',') if p.strip()]
     
     # 加载源人脸
     source_faces = load_source_faces(args.faces, args.hybrid, swap_all_mode, skip_positions)
