@@ -554,10 +554,17 @@ class GPUWorker:
         # Swap-All 模式配置
         self.swap_all_mode = swap_all_mode
         if swap_all_mode:
-            self.swap_all_source_face = source_faces['swap_face']  # 改名！
-            self.skip_positions = set(source_faces['skip_positions'])
-            if debug:
-                print(f"[DEBUG] GPU {gpu_id} 启用 Swap-All 模式，跳过位置: {self.skip_positions}")
+            self.swap_all_source_face = source_faces['swap_face']  # 正确：这是Face对象
+            skip_pos = source_faces['skip_positions']
+            # 支持 -1 表示不跳过任何人脸
+            if skip_pos == [-1]:
+                self.skip_positions = set()
+                if debug:
+                    print(f"[DEBUG] GPU {gpu_id} Swap-All 模式：不跳过任何人脸（全部替换）")
+            else:
+                self.skip_positions = set(skip_pos)
+                if debug:
+                    print(f"[DEBUG] GPU {gpu_id} 启用 Swap-All 模式，跳过位置: {self.skip_positions}")
         
         # Track管理
         self.initial_mapping_done = False
@@ -1601,9 +1608,9 @@ class GPUWorker:
                         if self.debug:
                             print(f"[DEBUG] GPU {self.gpu_id} Track {i} SKIP（自己换自己+透明化）")
                 else:
-                    # 其他位置：换成源脸
+                    # 其他位置：换成源脸（正确使用 swap_all_source_face）
                     self.track_source_map[i] = "SWAP"
-                    newf = self._safe_swap_face(processed_frame, face, self.swap_face,
+                    newf = self._safe_swap_face(processed_frame, face, self.swap_all_source_face,  # 修复：使用正确的属性
                                                f"GPU {self.gpu_id} 第一帧 Track {i}",
                                                track_id=i)
                     if newf is not None:
@@ -1629,8 +1636,8 @@ class GPUWorker:
                                     newf = self._safe_swap_face(frame, face, face,
                                                                f"重置后 Track {tid}", track_id=tid)
                                 else:
-                                    # SWAP: 换成源脸
-                                    newf = self._safe_swap_face(frame, face, self.swap_face,
+                                    # SWAP: 换成源脸（修复：使用正确的属性）
+                                    newf = self._safe_swap_face(frame, face, self.swap_all_source_face,
                                                                f"重置后 Track {tid}", track_id=tid)
                                 
                                 if newf is not None:
@@ -1690,8 +1697,8 @@ class GPUWorker:
                         newf = self._safe_swap_face(frame, current_face, current_face,
                                                    f"GPU{self.gpu_id}", track_id=tid)
                     else:
-                        # SWAP track：换成源脸
-                        newf = self._safe_swap_face(frame, current_face, self.swap_face,
+                        # SWAP track：换成源脸（修复：使用正确的属性）
+                        newf = self._safe_swap_face(frame, current_face, self.swap_all_source_face,
                                                    f"GPU{self.gpu_id}", track_id=tid)
                     
                     if newf is not None:
@@ -1739,8 +1746,8 @@ class GPUWorker:
                 self.track_source_map[new_tid] = "SWAP"
                 self.track_stability[new_tid] = 1
                 
-                # 立即换脸
-                newf = self._safe_swap_face(frame, face, self.swap_face,
+                # 立即换脸（修复：使用正确的属性）
+                newf = self._safe_swap_face(frame, face, self.swap_all_source_face,
                                            f"GPU{self.gpu_id} 新人脸", track_id=new_tid)
                 if newf is not None:
                     frame = newf
@@ -1761,7 +1768,6 @@ class GPUWorker:
         self.frame_idx += 1
         self._prune_tracks()
         return True, "完成"
-
 
     def _process_frame_normal(self, frame, faces_sorted, frame_path):
         """正常模式的帧处理（原有逻辑）"""
@@ -1975,9 +1981,9 @@ def _process_frame_with_worker(worker, frame, faces, frame_idx, debug):
                         from core.checkpoint_manager import log_with_time
                         log_with_time("DEBUG", f"Track {i} 标记为SKIP（自己换自己+透明化）")
                 else:
-                    # 换脸位置
+                    # 换脸位置（修复：使用正确的属性）
                     worker.track_source_map[i] = "SWAP"
-                    newf = worker._safe_swap_face(processed_frame, face, worker.swap_face, 
+                    newf = worker._safe_swap_face(processed_frame, face, worker.swap_all_source_face,  # 修复
                                                  f"GPU{worker.gpu_id}", track_id=i)
                     if newf is not None:
                         processed_frame = newf
@@ -2071,8 +2077,8 @@ def _process_frame_with_worker(worker, frame, faces, frame_idx, debug):
                 worker.skip_face_self_faces[tid] = current_face
                 src_face = current_face  # 使用自己作为源脸
             else:
-                # SWAP：换成源脸
-                src_face = worker.swap_face
+                # SWAP：换成源脸（修复：使用正确的属性）
+                src_face = worker.swap_all_source_face
         else:
             # 正常模式
             src_idx = worker.track_source_map.get(tid)
@@ -2157,8 +2163,8 @@ def _process_frame_with_worker(worker, frame, faces, frame_idx, debug):
             worker.track_source_map[new_tid] = "SWAP"
             worker.track_stability[new_tid] = 1
             
-            # 立即换脸
-            newf = worker._safe_swap_face(processed_frame, face, worker.swap_face,
+            # 立即换脸（修复：使用正确的属性）
+            newf = worker._safe_swap_face(processed_frame, face, worker.swap_all_source_face,
                                          f"GPU{worker.gpu_id} 新人脸", track_id=new_tid)
             if newf is not None:
                 processed_frame = newf
