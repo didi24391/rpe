@@ -1,5 +1,36 @@
 #!/usr/bin/env python3
 # run.py
+#以下内容到import argparse之前为在colab上面运行所需要增加代码
+import os
+
+# ------------------------
+# 强制 matplotlib 使用 Agg 后端，避免 notebook 专用后端报错
+# 必须在 import matplotlib 之前执行
+# ------------------------
+os.environ['MPLBACKEND'] = 'Agg'
+
+import matplotlib
+matplotlib.use('Agg')
+
+# ------------------------
+# 系统相关 & GPU 检测
+# ------------------------
+import sys
+import time
+import shutil
+
+import core.globals  # 注意：onnxruntime 会在这里被导入
+
+if not shutil.which('ffmpeg'):
+    print('ffmpeg is not installed. Read the docs: https://github.com/s0md3v/roop#installation.\n' * 10)
+    quit()
+
+if '--gpu' not in sys.argv:
+    core.globals.providers = ['CPUExecutionProvider']
+else:
+    import torch
+    if not torch.cuda.is_available():
+        quit("You are using --gpu flag but CUDA isn't available or properly installed on your system.")
 import argparse
 import os
 import shutil
@@ -305,8 +336,7 @@ def main(args):
             encoder=args.encoder,
             crf=args.crf,
             preset=args.preset,
-            swap_all_mode=swap_all_mode,
-            no_merge=args.no_merge  # 新增参数
+            swap_all_mode=swap_all_mode  # 新增参数
         )
         
         if success:
@@ -450,8 +480,6 @@ if __name__ == "__main__":
     # Worker数量
     parser.add_argument("--max-workers-per-gpu", type=int, default=4,
                        help="每个GPU最大worker数量（默认4，自动计算时的上限）")
-    parser.add_argument("--no-merge", action="store_true",
-                       help="只处理帧并保存segment，不进行合并和音频添加（保留临时文件）")
     
     args = parser.parse_args()
     
