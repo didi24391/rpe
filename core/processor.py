@@ -629,7 +629,7 @@ class GPUWorker:
         return model_configs.get(self.model_name, model_configs['inswapper_128'])
 
     def initialize_models(self):
-        """初始化模型"""
+        """初始化模型 - 使用640固定检测尺寸（InsightFace最佳实践）"""
         if self.initialized and self.models:
             return True
 
@@ -637,14 +637,12 @@ class GPUWorker:
             if self.debug:
                 print(f"[GPU {self.gpu_id}] 开始初始化模型: {self.model_name}")
             
-            # 创建推理会话提供器
             execution_device_id = str(self.gpu_id) if self.gpu_id >= 0 else "-1"
             providers = create_inference_session_providers(execution_device_id)
             
             if self.debug:
                 print(f"[GPU {self.gpu_id}] 使用提供器: {providers}")
             
-            # 显式为人脸检测器指定GPU
             ctx_id = self.gpu_id if self.gpu_id >= 0 else -1
             
             import insightface
@@ -654,7 +652,14 @@ class GPUWorker:
             log_with_time("INFO", f"GPU {self.gpu_id} 初始化人脸检测器: {name} (ctx_id={ctx_id})")
             
             analyser = insightface.app.FaceAnalysis(name=name, providers=providers)
-            analyser.prepare(ctx_id=ctx_id, det_size=(960, 960))
+            
+            # 使用 640x640（InsightFace 的最佳检测尺寸，平衡各种人脸大小）
+            det_size = (640, 640)
+            log_with_time("INFO", 
+                f"GPU {self.gpu_id} 检测尺寸: {det_size[0]}x{det_size[1]} "
+                f"(支持自动多尺度回退)")
+            
+            analyser.prepare(ctx_id=ctx_id, det_size=det_size)
             log_with_time("INFO", f"GPU {self.gpu_id} 人脸检测器初始化完成")
             
             # 初始化换脸模型
@@ -668,19 +673,20 @@ class GPUWorker:
 
             # 验证source_faces
             if self.swap_all_mode:
-                # Swap-All模式：验证单个源脸
-                emb = getattr(self.swap_all_source_face, "embedding", None)  # 改名！
-                model_src = getattr(self.swap_all_source_face, "source_model", getattr(self.swap_all_source_face, "detect_model", "unknown"))
-                print(f"[INFO] Swap-All源人脸loaded: source_model={model_src}, emb_norm={np.linalg.norm(np.array(emb)) if emb is not None else 'N/A'}")
+                emb = getattr(self.swap_all_source_face, "embedding", None)
+                model_src = getattr(self.swap_all_source_face, "source_model", 
+                                  getattr(self.swap_all_source_face, "detect_model", "unknown"))
+                print(f"[INFO] Swap-All源人脸loaded: source_model={model_src}, "
+                      f"emb_norm={np.linalg.norm(np.array(emb)) if emb is not None else 'N/A'}")
             else:
-                # 正常模式：验证多个源脸
                 for i, sf in enumerate(self.source_faces):
                     if sf is None:
                         print(f"[WARN] source_faces[{i}] is None")
                         continue
                     emb = getattr(sf, "embedding", None)
                     model_src = getattr(sf, "source_model", getattr(sf, "detect_model", "unknown"))
-                    print(f"[INFO] source_faces[{i}] loaded: source_model={model_src}, emb_norm={np.linalg.norm(np.array(emb)) if emb is not None else 'N/A'}")
+                    print(f"[INFO] source_faces[{i}] loaded: source_model={model_src}, "
+                          f"emb_norm={np.linalg.norm(np.array(emb)) if emb is not None else 'N/A'}")
 
             self.initialized = True
             print(f"[INFO] GPU {self.gpu_id} 准备就绪，使用模型: {self.model_name}")
@@ -699,6 +705,80 @@ class GPUWorker:
                 cleanup_gpu_memory(self.gpu_id)
             except Exception as e:
                 print(f"[WARN] cleanup_gpu_memory 调用失败: {e}")
+
+
+    def detect_faces_smart(self, frame):
+        """智能人脸检测 - 自动多尺度回退
+        
+        策略：
+        1. 先用标准640检测（最快，大多数情况有效）
+        2. 如果检测不到且图像较大，尝试缩小后检测（针对大人脸特写）
+        3. 如果检测不到且图像较小，尝试放大后检测（针对远景小人脸）
+        4. 自动将结果缩放回原始尺寸
+        """
+        
+        h, w = frame.shape[:2]
+        max_dim = max(h, w)
+        
+        # 步骤1：标准640检测（适用于90%的场景）
+        faces = self.models["analyser"].get(frame)
+        
+        if faces and len(faces) > 0:
+            return faces
+        
+        # 步骤2：如果检测不到，判断是否需要多尺度策略
+        
+        # 情况A：图像很大（>1080p），可能人脸太大 → 缩小后检测
+        if max_dim > 1080:
+            # 尝试缩小到不同比例
+            for scale in [0.7, 0.5, 0.35]:
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                new_w = (new_w // 2) * 2
+                new_h = (new_h // 2) * 2
+                
+                resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                faces = self.models["analyser"].get(resized)
+                
+                if faces and len(faces) > 0:
+                    if self.debug:
+                        print(f"[DEBUG] 缩小检测成功 ({w}x{h} → {new_w}x{new_h}, scale={scale:.2f})")
+                    
+                    # 缩放回原始尺寸
+                    for face in faces:
+                        if hasattr(face, 'bbox') and face.bbox is not None:
+                            face.bbox = face.bbox / scale
+                        if hasattr(face, 'kps') and face.kps is not None:
+                            face.kps = face.kps / scale
+                    
+                    return faces
+        
+        # 情况B：图像很小（<480p），可能人脸太小 → 放大后检测
+        elif max_dim < 480:
+            scale = 640 / max_dim
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            new_w = (new_w // 2) * 2
+            new_h = (new_h // 2) * 2
+            
+            enlarged = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            faces = self.models["analyser"].get(enlarged)
+            
+            if faces and len(faces) > 0:
+                if self.debug:
+                    print(f"[DEBUG] 放大检测成功 ({w}x{h} → {new_w}x{new_h}, scale={scale:.2f})")
+                
+                for face in faces:
+                    if hasattr(face, 'bbox') and face.bbox is not None:
+                        face.bbox = face.bbox / scale
+                    if hasattr(face, 'kps') and face.kps is not None:
+                        face.kps = face.kps / scale
+                
+                return faces
+        
+        # 所有策略都失败，返回空列表
+        return []
+
 
     def prepare_source_embedding(self, source_face):
         """准备源人脸embedding"""
@@ -864,41 +944,54 @@ class GPUWorker:
         return mask
 
     def swap_face(self, source_face, target_face, temp_vision_frame, is_skip=False):
-        """换脸主函数 - 支持pixel boost超分和skip机制
-        
-        参数:
-            source_face: 源人脸对象（要换成的脸）
-            target_face: 目标人脸对象（视频中的脸）
-            temp_vision_frame: 当前帧图像
-            is_skip: 是否跳过换脸（使用透明mask）
-        """
+        """换脸主函数 - 自适应 Pixel Boost"""
         model_options = self.get_model_options()
         model_template = model_options.get('template')
         model_size = model_options.get('size')
 
-        # 自动选择 pixel boost
-        if self.auto_pixel_boost and self.pixel_boost_selector is not None:
-            recommended_boost = self.pixel_boost_selector.select_pixel_boost(
-                target_face.bbox, self.frame_resolution
-            )
-            current_pixel_boost = recommended_boost
+        # 计算人脸大小，自动选择 Pixel Boost
+        face_width = target_face.bbox[2] - target_face.bbox[0]
+        face_height = target_face.bbox[3] - target_face.bbox[1]
+        face_size = (face_width + face_height) / 2
         
+        # 根据人脸大小智能选择 Pixel Boost
+        pixel_boost_options = model_options.get('pixel_boost_options', [])
+        
+        if self.auto_pixel_boost:
+            # 自动模式：根据人脸大小选择
+            if 'hyperswap' in self.model_name.lower():
+                # HyperSwap 模型
+                if face_size >= 350:
+                    current_pixel_boost = '768x768'
+                elif face_size >= 200:
+                    current_pixel_boost = '512x512'
+                else:
+                    current_pixel_boost = '256x256'
+            else:
+                # Inswapper 模型
+                if face_size >= 350:
+                    current_pixel_boost = '512x512'
+                elif face_size >= 150:
+                    current_pixel_boost = '256x256'
+                else:
+                    current_pixel_boost = '128x128'
+            
             if self.debug:
-                face_size = self.pixel_boost_selector.calculate_face_size(target_face.bbox)
-                print(f"[DEBUG] 人脸尺寸: {face_size:.1f}px, 选择 Pixel Boost: {recommended_boost}")
+                print(f"[DEBUG] 人脸大小: {face_size:.0f}px, 自动选择 Pixel Boost: {current_pixel_boost}")
         else:
+            # 手动模式：使用用户指定的 Pixel Boost
             current_pixel_boost = self.pixel_boost
+        
+        # 验证并调整 Pixel Boost
+        if current_pixel_boost not in pixel_boost_options:
+            # 如果指定的不可用，选择最接近的
+            if face_size > 300:
+                current_pixel_boost = pixel_boost_options[-1]  # 最高
+            else:
+                current_pixel_boost = pixel_boost_options[0]  # 最低
         
         pixel_boost_size = unpack_resolution(current_pixel_boost)
         pixel_boost_total = pixel_boost_size[0] // model_size[0]
-        
-        # 验证pixel boost是否合法
-        pixel_boost_options = model_options.get('pixel_boost_options', [])
-        if current_pixel_boost not in pixel_boost_options:
-            if self.debug:
-                print(f"[DEBUG] Pixel boost {current_pixel_boost} 不支持，使用默认 {pixel_boost_options[0]}")
-            pixel_boost_size = unpack_resolution(pixel_boost_options[0])
-            pixel_boost_total = pixel_boost_size[0] // model_size[0]
         
         # 获取人脸关键点
         face_landmark_5 = target_face.kps
@@ -916,9 +1009,6 @@ class GPUWorker:
         
         if pixel_boost_total > 1:
             # 使用pixel boost - 分块处理
-            if self.debug:
-                print(f"[DEBUG] 使用Pixel Boost: {pixel_boost_size} -> {model_size}, 分割为 {pixel_boost_total}x{pixel_boost_total} 块")
-            
             pixel_boost_vision_frames = implode_pixel_boost(crop_vision_frame, pixel_boost_total, model_size)
             
             for i, pixel_boost_vision_frame in enumerate(pixel_boost_vision_frames):
@@ -931,18 +1021,12 @@ class GPUWorker:
             
         else:
             # 不使用pixel boost - 直接处理
-            if self.debug:
-                print(f"[DEBUG] 直接处理: {pixel_boost_size}")
-            
             crop_vision_frame_input = self.prepare_crop_frame(crop_vision_frame)
             crop_vision_frame_output = self.forward_swap_face(source_face, target_face, crop_vision_frame_input)
             crop_vision_frame_output = self.normalize_crop_frame(crop_vision_frame_output)
         
         # 创建遮罩
         crop_mask = self.create_simple_mask(crop_vision_frame_output)
-        
-        if is_skip and self.debug:
-            print(f"[SWAP_FACE] is_skip=True，将使用透明mask")
         
         # 贴回原图（skip人脸使用透明化）
         paste_vision_frame = self.paste_back(temp_vision_frame, crop_vision_frame_output, 
@@ -1379,7 +1463,7 @@ class GPUWorker:
         return recovered
 
     def process_frame(self, frame_path):
-        """处理单帧 - 主入口（支持swap-all模式）"""
+        """处理单帧 - 使用智能检测"""
         if not self.models:
             return False, "模型未初始化"
 
@@ -1387,7 +1471,9 @@ class GPUWorker:
         if frame is None:
             return False, f"无法读取 {frame_path}"
 
-        faces = self.models["analyser"].get(frame)
+        # 使用智能多尺度检测（自动回退）
+        faces = self.detect_faces_smart(frame)
+        
         if not faces:
             cv2.imwrite(frame_path, frame)
             self.frame_idx += 1
@@ -1397,10 +1483,8 @@ class GPUWorker:
         faces_sorted = sorted(faces, key=lambda x: x.bbox[0])
 
         if self.swap_all_mode:
-            # Swap-All 模式处理
             return self._process_frame_swap_all(frame, faces_sorted, frame_path)
         else:
-            # 正常模式处理
             return self._process_frame_normal(frame, faces_sorted, frame_path)
 
         # 第一帧初始化
@@ -2737,7 +2821,9 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                 cap_init.release()
                 
                 if ret and first_frame is not None:
-                    faces = worker.models["analyser"].get(first_frame)
+                    # ===== 关键修改：使用智能检测 =====
+                    faces = worker.detect_faces_smart(first_frame)  # 改为使用智能检测
+                    
                     if faces:
                         faces_sorted = sorted(faces, key=lambda x: x.bbox[0])
                         
@@ -2807,7 +2893,8 @@ def process_video_direct_checkpoint(source_faces, target_path, output_path,
                         processed_frame = None
                         
                         try:
-                            faces = worker.models["analyser"].get(frame)
+                            # ===== 关键修改：使用智能检测 =====
+                            faces = worker.detect_faces_smart(frame)  # 改为使用智能检测
                             
                             if not faces:
                                 worker.frame_idx = frame_idx
